@@ -1,0 +1,11 @@
+﻿*.exe
+*.pdb
+*.zip
+preview-*.png
+*-test-result.txt
+self-test-result.txt
+save-tests-*/
+bin/
+obj/
+.vs/
+*.tmp
