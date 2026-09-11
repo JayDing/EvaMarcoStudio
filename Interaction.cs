@@ -7,10 +7,11 @@ using System.Threading.Tasks;
 using System.Windows.Forms;
 
 public class ActionGrid:DataGridView {
- public event Action<int[],int> ReorderRequested;
+ public event Action<int[],int> ReorderRequested;public event Action<int,int> CellEditRequested;
+ protected override void OnMouseDoubleClick(MouseEventArgs e){pending=false;base.OnMouseDoubleClick(e);if(e.Button==MouseButtons.Left&&CellEditRequested!=null){var hit=HitTest(e.X,e.Y);CellEditRequested(hit.RowIndex,hit.ColumnIndex);}}
  Point origin;bool pending;int insertion=-1;
  class DragRows {public ActionGrid Owner;public int[] Rows;}
- public ActionGrid(){AllowDrop=true;MultiSelect=true;}
+ public ActionGrid(){DoubleBuffered=true;AllowDrop=true;MultiSelect=true;}
  protected override void OnMouseDown(MouseEventArgs e){
   if(IsCurrentCellInEditMode){base.OnMouseDown(e);pending=false;return;}var hit=HitTest(e.X,e.Y);if(e.Button==MouseButtons.Right&&hit.RowIndex>=0&&Rows[hit.RowIndex].Selected){pending=false;return;}bool preserve=e.Button==MouseButtons.Left&&hit.RowIndex>=0&&Rows[hit.RowIndex].Selected&&(ModifierKeys&Keys.Control)==0&&((ModifierKeys&Keys.Shift)==0||SelectedRows.Count>1);
   if(!preserve)base.OnMouseDown(e);pending=e.Button==MouseButtons.Left&&hit.RowIndex>=0;origin=e.Location;
@@ -46,4 +47,9 @@ public class CountdownOverlay:Form {
  protected override void OnPaint(PaintEventArgs e){base.OnPaint(e);using(var font=new Font("Segoe UI",88,FontStyle.Bold))using(var small=new Font("Microsoft JhengHei UI",12))using(var center=new StringFormat{Alignment=StringAlignment.Center,LineAlignment=StringAlignment.Center}){e.Graphics.DrawString(number.ToString(),font,Brushes.White,new RectangleF(0,12,Width,180),center);e.Graphics.DrawString("即將開始 · F10 停止",small,Brushes.LightSkyBlue,new RectangleF(0,200,Width,40),center);}}
  public static async Task Count(CancellationToken token,Action<int> display,Func<int,CancellationToken,Task> wait){for(int n=3;n>=1;n--){token.ThrowIfCancellationRequested();display(n);await wait(1000,token);}token.ThrowIfCancellationRequested();}
  public static async Task Run(CancellationToken token,Action<string> report){using(var overlay=new CountdownOverlay()){overlay.Show();await Count(token,n=>{overlay.SetNumber(n);report(n+" 秒後開始，請切換至目標視窗。F10 停止");},(ms,ct)=>Task.Delay(ms,ct));}}
+}
+
+public class BufferedEditorPanel:TableLayoutPanel {
+ public BufferedEditorPanel(){DoubleBuffered=true;SetStyle(ControlStyles.AllPaintingInWmPaint|ControlStyles.OptimizedDoubleBuffer,true);}
+
 }

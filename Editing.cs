@@ -11,8 +11,6 @@ public class KeyPicker:FlowLayoutPanel {
   input=new CaptureBox(this){Width=260,Text="Space"};Controls.Add(input);Controls.Add(capture);
   capture.Click+=(s,e)=>{if(Recording)StopCapture();else{Recording=true;AnyRecording=true;input.ReadOnly=true;capture.Text="捕捉中（Esc 取消）";input.Focus();}};
   input.LostFocus+=(s,e)=>StopCapture();SetFlowBreak(capture,true);
-  foreach(string name in new[]{"Space","Enter","Delete","Tab","Escape","Back"}){string selected=name;var b=new Button{Text=name,AutoSize=true};b.Click+=(s,e)=>{StopCapture();Value=selected;};Controls.Add(b);}
-  SetFlowBreak(Controls[Controls.Count-1],true);Controls.Add(new Label{Text="單鍵按一下即可；組合鍵一起按。也可輸入 A 或 Ctrl+S。",AutoSize=true,ForeColor=Color.DimGray});
  }
  public string Value{get{return input.Text.Trim();}set{StopCapture();input.Text=value??"Space";}}
  public void StopCapture(){if(!Recording)return;Recording=false;AnyRecording=false;input.ReadOnly=false;capture.Text="捕捉按鍵";}
@@ -24,8 +22,10 @@ public class KeyPicker:FlowLayoutPanel {
 public class CrosshairDrag:Control {
  readonly Func<Point> read;readonly Action<Point> write;readonly List<MarkerOverlay> overlays=new List<MarkerOverlay>();Point before;double opacity;Form form;
  public bool Dragging{get;private set;}
- public CrosshairDrag(Func<Point> get,Action<Point> set){read=get;write=set;Width=310;Height=40;Cursor=Cursors.SizeAll;BackColor=Color.FromArgb(235,243,255);SetStyle(ControlStyles.Selectable,true);TabStop=true;}
- protected override void OnPaint(PaintEventArgs e){base.OnPaint(e);using(var pen=new Pen(Color.FromArgb(0,102,204),2)){e.Graphics.DrawLine(pen,10,20,34,20);e.Graphics.DrawLine(pen,22,8,22,32);e.Graphics.DrawEllipse(pen,16,14,12,12);}e.Graphics.DrawString("拖曳十字至目標（Esc 取消）",Font,Brushes.Black,44,11);}
+ public CrosshairDrag(Func<Point> get,Action<Point> set){read=get;write=set;AutoSize=true;Width=360;Height=44;Cursor=Cursors.SizeAll;BackColor=Color.FromArgb(235,243,255);SetStyle(ControlStyles.Selectable,true);TabStop=true;}
+ protected override void OnPaint(PaintEventArgs e){base.OnPaint(e);using(var pen=new Pen(Color.FromArgb(0,102,204),2)){e.Graphics.DrawLine(pen,10,20,34,20);e.Graphics.DrawLine(pen,22,8,22,32);e.Graphics.DrawEllipse(pen,16,14,12,12);}TextRenderer.DrawText(e.Graphics,"拖曳十字至目標（Esc 取消）",Font,new Rectangle(44,0,Width-48,Height),Color.Black,TextFormatFlags.Left|TextFormatFlags.VerticalCenter|TextFormatFlags.NoPrefix);}
+ public override Size GetPreferredSize(Size proposedSize){var text=TextRenderer.MeasureText("拖曳十字至目標（Esc 取消）",Font);return new Size(text.Width+60,Math.Max(44,text.Height+16));}
+ protected override void OnFontChanged(EventArgs e){base.OnFontChanged(e);Size=GetPreferredSize(Size.Empty);}
  protected override void OnMouseDown(MouseEventArgs e){base.OnMouseDown(e);if(e.Button!=MouseButtons.Left)return;Focus();before=read();Dragging=true;form=FindForm();if(form!=null){opacity=form.Opacity;form.Opacity=.20;}Capture=true;}
  protected override void OnMouseMove(MouseEventArgs e){base.OnMouseMove(e);if(!Dragging)return;var p=Cursor.Position;write(p);if(overlays.Count==0)foreach(var screen in Screen.AllScreens)overlays.Add(new MarkerOverlay(screen.Bounds));foreach(var o in overlays){o.Markers=new List<PointMarker>{new PointMarker{Position=p,Label="新增預覽",Preview=true}};if(!o.Visible)o.Show();o.Invalidate();}}
  protected override void OnMouseUp(MouseEventArgs e){base.OnMouseUp(e);if(Dragging&&e.Button==MouseButtons.Left){var p=Cursor.Position;write(Screen.AllScreens.Any(sc=>sc.Bounds.Contains(p))?p:before);Finish(false);}}
@@ -59,7 +59,7 @@ public class StepEditor:Form {
    drag.MouseCaptureChanged+=(s,e)=>{if(dragging&&!drag.Capture)EndDrag(true);};layout.Controls.Add(drag);layout.Controls.Add(location);
    x.ValueChanged+=(s,e)=>Preview();y.ValueChanged+=(s,e)=>Preview();
   }else if(step.Type=="鍵盤按壓"){
-   key.Value=step.Value;layout.Controls.Add(new Label{Text="按「捕捉按鍵」再按一次單鍵或組合鍵；也可直接輸入 A 或 Ctrl+S。",AutoSize=true});layout.Controls.Add(key);
+   key.Value=step.Value;layout.Controls.Add(key);
   }
   var timing=Row();if(step.Type!="等待")Field(timing,"按住（ms）",hold);Field(timing,"動作後等待（sec）",delay);layout.Controls.Add(timing);
   notes.Text=step.Notes??"";layout.Controls.Add(new Label{Text="備註（選填，可輸入文字、數字或多行內容）",AutoSize=true});layout.Controls.Add(notes);var actions=Row();Button save=new Button{Text="儲存修改",AutoSize=true},cancel=new Button{Text="取消",AutoSize=true,DialogResult=DialogResult.Cancel};actions.Controls.Add(save);actions.Controls.Add(cancel);layout.Controls.Add(actions);AcceptButton=save;CancelButton=cancel;
@@ -77,4 +77,18 @@ public class StepEditor:Form {
  void Preview(){location.Text="目標座標：X = "+x.Value+"，Y = "+y.Value;if(!ready||source.Type!="滑鼠點擊")return;if(overlays.Count==0)foreach(var screen in Screen.AllScreens)overlays.Add(new MarkerOverlay(screen.Bounds));foreach(var overlay in overlays){overlay.Markers=new List<PointMarker>{new PointMarker{Position=new Point((int)x.Value,(int)y.Value),Label=source.Sequence+" · 修改預覽",Preview=true}};if(!overlay.Visible)overlay.Show();overlay.Invalidate();}}
  void ClearPreview(){foreach(var overlay in overlays)overlay.Dispose();overlays.Clear();}
  protected override void Dispose(bool disposing){if(disposing){if(dragging)EndDrag(true);ClearPreview();}base.Dispose(disposing);}
+}
+
+public class UnsavedChangesDialog:Form {
+ public UnsavedChangesDialog(){
+  Text=" ";Font=new Font("Microsoft JhengHei UI",10);AutoSize=true;AutoSizeMode=AutoSizeMode.GrowAndShrink;FormBorderStyle=FormBorderStyle.FixedDialog;StartPosition=FormStartPosition.CenterParent;MaximizeBox=false;MinimizeBox=false;ShowInTaskbar=false;
+  var layout=new FlowLayoutPanel{AutoSize=true,AutoSizeMode=AutoSizeMode.GrowAndShrink,FlowDirection=FlowDirection.TopDown,WrapContents=false,Padding=new Padding(20)};Controls.Add(layout);
+  layout.Controls.Add(new Label{AutoSize=true,Text="尚未儲存",Font=new Font(Font,FontStyle.Bold),Margin=new Padding(3,3,3,12)});
+  layout.Controls.Add(new Label{AutoSize=true,Text="範本有尚未儲存的修改。\n按「確定」放棄修改並離開；按「取消」返回編輯。".Replace("\n",Environment.NewLine),Margin=new Padding(3,3,3,18)});
+  var actions=new FlowLayoutPanel{AutoSize=true,WrapContents=false};layout.Controls.Add(actions);
+  var discard=new Button{Text="確定",AutoSize=true,Padding=new Padding(12,6,12,6),DialogResult=DialogResult.Yes};
+  var cancel=new Button{Text="取消",AutoSize=true,Padding=new Padding(12,6,12,6),DialogResult=DialogResult.Cancel};
+  var save=new Button{Text="儲存並關閉",AutoSize=true,Padding=new Padding(12,6,12,6),DialogResult=DialogResult.Retry};
+  actions.Controls.Add(discard);actions.Controls.Add(cancel);actions.Controls.Add(save);CancelButton=cancel;AcceptButton=cancel;
+ }
 }

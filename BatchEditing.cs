@@ -1,12 +1,15 @@
-using System;
+﻿using System;
 using System.Collections.Generic;
 using System.Drawing;
 using System.Globalization;
 using System.Linq;
 using System.Windows.Forms;
 
+public class SecondsInput:NumericUpDown {
+ protected override void UpdateEditText(){Text=Value.ToString("0.0##",CultureInfo.CurrentCulture);}
+}
 public static class WaitUnits {
- public static NumericUpDown Control(){return new NumericUpDown{Minimum=0,Maximum=86400,DecimalPlaces=3,Increment=.1m,Value=1,Width=110};}
+ public static NumericUpDown Control(){return new SecondsInput{Minimum=0,Maximum=86400,DecimalPlaces=3,Increment=.1m,Value=1,Width=110};}
  public static int ToMilliseconds(decimal seconds){decimal ms=seconds*1000;if(ms<0||ms>86400000||ms!=decimal.Truncate(ms))throw new Exception("動作後等待須為 0～86400 sec，最多三位小數。");return (int)ms;}
  public static int Parse(string text){decimal seconds;if(!decimal.TryParse(text,NumberStyles.AllowLeadingSign|NumberStyles.AllowDecimalPoint,CultureInfo.CurrentCulture,out seconds))throw new Exception("請輸入有效秒數，例如 1 或 0.5。");return ToMilliseconds(seconds);}
  public static Color RowColor(string type){return type=="滑鼠點擊"?Color.FromArgb(230,243,255):type=="鍵盤按壓"?Color.FromArgb(233,247,235):Color.FromArgb(255,245,218);}
