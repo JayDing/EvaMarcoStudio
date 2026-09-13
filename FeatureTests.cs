@@ -74,6 +74,16 @@ public static class FeatureTests {
   var transitionWaits=new List<int>();MacroRunner.RunSequence(estimatePlan,CancellationToken.None,s=>{},(a,ct)=>Task.FromResult(0),(ms,ct)=>{transitionWaits.Add(ms);return Task.FromResult(0);}).GetAwaiter().GetResult();
   Check(transitionWaits.Contains(1750)&&!transitionWaits.Contains(9000),"Runner uses per-template transition");
   var persisted=new JavaScriptSerializer().Deserialize<SequencePlan>(new JavaScriptSerializer().Serialize(estimatePlan));Check(persisted.Items[0].TransitionDelay==1750,"Per-template transition persists");
+  var repeated=new SequencePlan{OuterRuns=2,OuterGap=700,Items=new List<SequenceItem>{Item("A",1),Item("B",1)},TransitionDelay=300};
+  var repeatedTrace=new List<string>();var repeatedWaits=new List<int>();
+  MacroRunner.RunSequence(repeated,CancellationToken.None,s=>{},(a,ct)=>{repeatedTrace.Add(a.Value);return Task.FromResult(0);},(ms,ct)=>{repeatedWaits.Add(ms);return Task.FromResult(0);}).GetAwaiter().GetResult();
+  Check(string.Join(",",repeatedTrace)=="A,B,A,B"&&repeatedWaits.Count(ms=>ms==700)==1&&repeatedWaits.Count(ms=>ms==300)==2,"Whole sequence loops in order with outer wait only between cycles");
+  Check(SequenceForm.EstimateMilliseconds(repeated)==4396,"Repeated sequence estimate counts initial countdown once");
+  repeated.OuterRuns=0;Check(SequenceForm.EstimateMilliseconds(repeated)==-1,"Continuous sequence estimate");
+  using(var stop=new CancellationTokenSource()){int actions=0;bool stopped=false;try{MacroRunner.RunSequence(repeated,stop.Token,s=>{},(a,ct)=>{if(++actions==3)stop.Cancel();return Task.FromResult(0);},(ms,ct)=>{ct.ThrowIfCancellationRequested();return Task.FromResult(0);}).GetAwaiter().GetResult();}catch(OperationCanceledException){stopped=true;}Check(stopped&&actions==3,"Continuous whole sequence cancellation");}
+  var legacyPlan=new JavaScriptSerializer().Deserialize<SequencePlan>("{\"Kind\":\"MacroSequence\",\"Version\":1,\"Items\":[]}");
+  Check(legacyPlan.OuterRuns==1&&legacyPlan.OuterGap==1000,"Old sequence defaults to one pass");
+  using(var iconStream=System.Reflection.Assembly.GetExecutingAssembly().GetManifestResourceStream("EvaMacroStudio.AppIcon")){Check(iconStream!=null&&AppIdentity.Icon.Width>0,"Embedded application icon");}
   var original=new Step{Type="滑鼠點擊",Value="左鍵",X=20,Y=30,Hold=50,Delay=1000,Notes="before"};Check(CellEdits.Apply(original,6,"1.5").Delay==1500&&original.Delay==1000,"Cell edit clone isolation");Check(CellEdits.Apply(original,2,"-200").X==-200&&CellEdits.Apply(original,7,"測試 123").Notes=="測試 123","Cell coordinates and notes");foreach(string invalid in new[]{"-1","1.0001","abc","999999999999"}){bool rejected=false;try{CellEdits.Apply(original,6,invalid);}catch{rejected=true;}Check(rejected,"Reject invalid cell numeric input");}Check(!CellEdits.CanEdit(original,0)&&!CellEdits.CanEdit(new Step{Type="等待"},2),"Nonapplicable cells read only");
   var forecasts=new List<string>();var forecastTemplate=new Template{Gap=40,Steps=new List<Step>{new Step{Type="鍵盤按壓",Value="A",Hold=20,Delay=100},new Step{Type="等待",Delay=200}}};
   MacroRunner.RunTemplate(forecastTemplate,2,CancellationToken.None,s=>{},(a,ct)=>Task.FromResult(0),(ms,ct)=>Task.FromResult(0),upcoming:(a,ms)=>forecasts.Add((a==null?"完成":a.Type)+":"+ms)).GetAwaiter().GetResult();

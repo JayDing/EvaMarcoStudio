@@ -9,6 +9,10 @@ using System.Threading.Tasks;
 using System.Web.Script.Serialization;
 using System.Windows.Forms;
 
+[assembly: System.Reflection.AssemblyTitle("FishMarco")]
+[assembly: System.Reflection.AssemblyProduct("FishMarco")]
+[assembly: System.Reflection.AssemblyDescription("生活俠的小幫手")]
+
 public class Step {
  public string Notes {get;set;} public int Sequence {get;set;} public string Type {get;set;} public int X {get;set;} public int Y {get;set;}
  public string Value {get;set;} public int Hold {get;set;} public int Delay {get;set;}
@@ -70,11 +74,11 @@ public class MainForm:Form {
  static NumericUpDown Num(int min,int max,int value){return new NumericUpDown{Minimum=min,Maximum=max,Value=value,Width=100};}
  static bool selfTesting;SequenceItem editingSequenceItem;string sessionLoadError;
  public MainForm(){
- DoubleBuffered=true;Text="動作範本工作室";Size=new Size(1160,940);MinimumSize=new Size(1160,700);BackColor=Color.FromArgb(245,247,250);Font=new Font("Microsoft JhengHei UI",10);StartPosition=FormStartPosition.CenterScreen;
+ Icon=AppIdentity.Icon;DoubleBuffered=true;Text="生活俠的小幫手";Size=new Size(1160,940);MinimumSize=new Size(1160,700);BackColor=Color.FromArgb(245,247,250);Font=new Font("Microsoft JhengHei UI",10);StartPosition=FormStartPosition.CenterScreen;
  var shell=new Panel{Dock=DockStyle.Fill};Controls.Add(shell);var scroll=new Panel{Dock=DockStyle.Fill,AutoScroll=true};shell.Controls.Add(scroll);var footer=new TableLayoutPanel{Dock=DockStyle.Bottom,AutoSize=true,AutoSizeMode=AutoSizeMode.GrowAndShrink,RowCount=2,ColumnCount=1,Padding=new Padding(16,4,16,4)};footer.ColumnStyles.Add(new ColumnStyle(SizeType.Percent,100));for(int i=0;i<2;i++)footer.RowStyles.Add(new RowStyle(SizeType.AutoSize));shell.Controls.Add(footer);
  var layout=new TableLayoutPanel{Dock=DockStyle.Fill,MinimumSize=new Size(0,540),AutoSize=false,AutoSizeMode=AutoSizeMode.GrowAndShrink,RowCount=3,ColumnCount=1,Padding=new Padding(16,12,16,4)};layout.ColumnStyles.Add(new ColumnStyle(SizeType.Percent,100));scroll.Controls.Add(layout);
  for(int i=0;i<3;i++)layout.RowStyles.Add(new RowStyle(i==2?SizeType.Percent:SizeType.AutoSize,i==2?100:0));
- var toolbar=Row();layout.Controls.Add(Section(Color.FromArgb(170,170,170),toolbar),0,0);AddButton(toolbar,"新增範本",()=>{if(ConfirmReplace()){editingSequenceItem=null;grid.Rows.Clear();draftVisible=false;RefreshMarkers();repeat.Value=0;gap.Value=1;delay.Value=1;keys.Value="Space";notes.Text="";templateName="未命名範本";Text="動作範本工作室｜未命名";MarkSaved(null);}});AddButton(toolbar,"載入範本",LoadTemplate);AddButton(toolbar,"另存範本",SaveTemplate);AddButton(toolbar,"範本組合…",OpenSequence);
+ var toolbar=Row();layout.Controls.Add(Section(Color.FromArgb(170,170,170),toolbar),0,0);AddButton(toolbar,"新增範本",()=>{if(ConfirmReplace()){editingSequenceItem=null;grid.Rows.Clear();draftVisible=false;RefreshMarkers();repeat.Value=0;gap.Value=1;delay.Value=1;keys.Value="Space";notes.Text="";templateName="未命名範本";Text="生活俠的小幫手｜未命名";MarkSaved(null);}});AddButton(toolbar,"載入範本",LoadTemplate);AddButton(toolbar,"另存範本",SaveTemplate);AddButton(toolbar,"範本組合…",OpenSequence);
 
  showMarkers.Font=Font;showMarkers.FlatAppearance.BorderColor=Color.Silver;showMarkers.Click+=(s,e)=>{markersVisible=!markersVisible;showMarkers.Text=markersVisible?"關閉螢幕點位":"顯示螢幕點位";showMarkers.BackColor=markersVisible?Color.White:Color.FromArgb(235,235,235);RefreshMarkers();};
  var editor=new BufferedEditorPanel{Dock=DockStyle.Top,AutoSize=true,AutoSizeMode=AutoSizeMode.GrowAndShrink,RowCount=4,ColumnCount=1,BackColor=Color.Transparent,Padding=new Padding(4)};editor.ColumnStyles.Add(new ColumnStyle(SizeType.Percent,100));
@@ -96,14 +100,14 @@ public class MainForm:Form {
  }
  void OpenSequence(){
   if(cancel!=null||capturing||editingDialog)return;keys.StopCapture();editingDialog=true;RefreshMarkers();
-  try{using(var window=new SequenceForm(()=>hotkeysReady,item=>EditSequenceTemplate(item))){sequenceWindow=window;foreach(var item in savedSequence.Items)window.AddItem(item);window.SetTransition(savedSequence.TransitionDelay);window.ShowDialog(this);savedSequence=window.Current();SaveSequenceSession();}}
+  try{using(var window=new SequenceForm(()=>hotkeysReady,item=>EditSequenceTemplate(item))){sequenceWindow=window;foreach(var item in savedSequence.Items)window.AddItem(item);window.SetTransition(savedSequence.TransitionDelay);window.SetOuterLoop(savedSequence.OuterRuns,savedSequence.OuterGap);window.ShowDialog(this);savedSequence=window.Current();SaveSequenceSession();}}
   finally{sequenceWindow=null;editingDialog=false;RefreshMarkers();}
  }
  void SaveSequenceSession(){if(!selfTesting)SequenceSession.Save(SequenceSession.DefaultPath,savedSequence);}
  bool EditSequenceTemplate(SequenceItem item,Func<bool> confirm=null){
   var serializer=new JavaScriptSerializer{MaxJsonLength=64*1024*1024};var template=serializer.Deserialize<Template>(serializer.Serialize(item.Template));Validate(template);
   if(!(confirm??ConfirmLeave)())return false;
-  ApplyTemplate(template);editingSequenceItem=item;templateName=item.Name;Text="動作範本工作室｜"+item.Name;
+  ApplyTemplate(template);editingSequenceItem=item;templateName=item.Name;Text="生活俠的小幫手｜"+item.Name;
   string path=SequenceForm.MissingSource(item)?null:item.SourcePath;MarkSaved(path);
   if(path!=null){try{var source=serializer.Deserialize<Template>(File.ReadAllText(path));Validate(source);savedSnapshot=json.Serialize(source);}catch{savedSnapshot=null;}}
   status.Text=path==null?"已開啟組合內的範本；儲存時請選擇檔案位置。":"已開啟範本："+path;return true;
@@ -207,7 +211,7 @@ public class MainForm:Form {
   var t=Current();Validate(t);string content=json.Serialize(t);string fullPath=Path.GetFullPath(path);string temp=fullPath+"."+Guid.NewGuid().ToString("N")+".tmp";
   try{File.WriteAllText(temp,content,System.Text.Encoding.UTF8);if(File.Exists(fullPath))File.Replace(temp,fullPath,null);else File.Move(temp,fullPath);}
   finally{if(File.Exists(temp))File.Delete(temp);}
-  if(editingSequenceItem!=null){editingSequenceItem.Template=json.Deserialize<Template>(content);editingSequenceItem.SourcePath=fullPath;}currentTemplatePath=fullPath;savedSnapshot=content;templateName=Path.GetFileNameWithoutExtension(fullPath);Text="動作範本工作室｜"+Path.GetFileName(fullPath);status.Text="已儲存："+Path.GetFileName(fullPath);
+  if(editingSequenceItem!=null){editingSequenceItem.Template=json.Deserialize<Template>(content);editingSequenceItem.SourcePath=fullPath;}currentTemplatePath=fullPath;savedSnapshot=content;templateName=Path.GetFileNameWithoutExtension(fullPath);Text="生活俠的小幫手｜"+Path.GetFileName(fullPath);status.Text="已儲存："+Path.GetFileName(fullPath);
  }
  void SaveTemplate(){using(var d=new SaveFileDialog{Filter="動作範本 (*.json)|*.json",DefaultExt="json",FileName=currentTemplatePath==null?"我的動作範本.json":Path.GetFileName(currentTemplatePath),InitialDirectory=currentTemplatePath==null?null:Path.GetDirectoryName(currentTemplatePath)})if(d.ShowDialog(sequenceWindow!=null?(IWin32Window)sequenceWindow:this)==DialogResult.OK)SaveToPath(d.FileName);}
  void SaveCurrentTemplate(){if(currentTemplatePath==null)SaveTemplate();else SaveToPath(currentTemplatePath);}
@@ -223,7 +227,7 @@ public class MainForm:Form {
  void UndoAction(){if(cancel!=null||capturing||editingDialog||undoActions.Count==0)return;string previous=undoActions.Pop();actionState=previous;ReplaceActions(json.Deserialize<List<Step>>(previous));status.Text="已復原上一個編輯動作";}
  void CopyActions(){if(grid.SelectedRows.Count==0)return;copiedActions=grid.SelectedRows.Cast<DataGridViewRow>().OrderBy(r=>r.Index).Select(r=>CopyStep((Step)r.Tag)).ToList();}
  void PasteActions(){if(cancel!=null||capturing||editingDialog||copiedActions.Count==0)return;int index=grid.SelectedRows.Count==0?grid.Rows.Count:grid.SelectedRows.Cast<DataGridViewRow>().Max(r=>r.Index)+1;rebuilding=true;try{grid.Rows.Insert(index,copiedActions.Count);for(int i=0;i<copiedActions.Count;i++)SetRow(grid.Rows[index+i],CopyStep(copiedActions[i]));grid.CurrentCell=grid.Rows[index].Cells[0];grid.ClearSelection();for(int i=0;i<copiedActions.Count;i++)grid.Rows[index+i].Selected=true;}finally{rebuilding=false;}Renumber();status.Text="已貼上 "+copiedActions.Count+" 個動作";}
- void LoadTemplate(){using(var d=new OpenFileDialog{Filter="動作範本 (*.json)|*.json"})if(d.ShowDialog()==DialogResult.OK){var t=json.Deserialize<Template>(File.ReadAllText(d.FileName));Validate(t);if(!ConfirmReplace())return;editingSequenceItem=null;ApplyTemplate(t);templateName=Path.GetFileNameWithoutExtension(d.FileName);Text="動作範本工作室｜"+Path.GetFileName(d.FileName);draftVisible=false;Renumber();MarkSaved(Path.GetFullPath(d.FileName));status.Text="已載入範本（Ctrl+S 可直接儲存）";}}
+ void LoadTemplate(){using(var d=new OpenFileDialog{Filter="動作範本 (*.json)|*.json"})if(d.ShowDialog()==DialogResult.OK){var t=json.Deserialize<Template>(File.ReadAllText(d.FileName));Validate(t);if(!ConfirmReplace())return;editingSequenceItem=null;ApplyTemplate(t);templateName=Path.GetFileNameWithoutExtension(d.FileName);Text="生活俠的小幫手｜"+Path.GetFileName(d.FileName);draftVisible=false;Renumber();MarkSaved(Path.GetFullPath(d.FileName));status.Text="已載入範本（Ctrl+S 可直接儲存）";}}
  public static ushort[] ParseKeys(string text){var result=new List<ushort>();foreach(var part in (text??"").Split('+')){string p=part.Trim();Keys k;switch(p.ToUpperInvariant()){case "CTRL":case "CONTROL":k=Keys.ControlKey;break;case "ALT":k=Keys.Menu;break;case "SHIFT":k=Keys.ShiftKey;break;case "WIN":k=Keys.LWin;break;default:if(p.Length==1&&char.IsDigit(p[0]))k=(Keys)(48+p[0]-'0');else if(!Enum.TryParse<Keys>(p,true,out k))throw new Exception("不支援的按鍵："+p);break;}int v=(int)k;if(v<8||v>254||k==Keys.F9||k==Keys.F10)throw new Exception("按鍵無效或為保留熱鍵："+p);if(result.Contains((ushort)v))throw new Exception("組合鍵不可重複。");result.Add((ushort)v);}return result.ToArray();}
  public static void ValidateStep(Step s){if(s==null||!(new[]{"滑鼠點擊","鍵盤按壓","等待"}).Contains(s.Type))throw new Exception("範本包含無效動作。");if(s.Hold<0||s.Hold>600000||s.Delay<0||s.Delay>86400000||Math.Abs((long)s.X)>100000||Math.Abs((long)s.Y)>100000)throw new Exception("時間或座標超出允許範圍。");if(s.Type=="鍵盤按壓")ParseKeys(s.Value);if(s.Type=="滑鼠點擊"&&!(new[]{"左鍵","右鍵","中鍵"}).Contains(s.Value))throw new Exception("滑鼠按鈕無效。");}
  public static void Validate(Template t){if(t==null||t.Version!=1||t.Steps==null||t.Steps.Count>10000||t.Repeats<0||t.Repeats>1000000||t.Gap<0||t.Gap>86400000)throw new Exception("範本格式或循環設定無效。");foreach(var s in t.Steps)ValidateStep(s);}

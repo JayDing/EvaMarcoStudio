@@ -9,10 +9,10 @@ using System.Web.Script.Serialization;
 using System.Windows.Forms;
 
 public class SequenceItem {public string SourcePath{get;set;} public int? TransitionDelay{get;set;} public string Name{get;set;} public int Runs{get;set;} public Template Template{get;set;}}
-public class SequencePlan {
+public class SequencePlan {public int OuterRuns{get;set;} public int OuterGap{get;set;}
  public string Kind{get;set;} public int Version{get;set;} public int TransitionDelay{get;set;} public List<SequenceItem> Items{get;set;}
- public SequencePlan(){Kind="MacroSequence";Version=1;TransitionDelay=1000;Items=new List<SequenceItem>();}
- public static void Validate(SequencePlan p){if(p==null||p.Kind!="MacroSequence"||p.Version!=1||p.Items==null||p.Items.Count>1000||p.TransitionDelay<0||p.TransitionDelay>86400000)throw new Exception("範本組合格式無效。");foreach(var i in p.Items){if(i==null||string.IsNullOrWhiteSpace(i.Name)||i.Runs<1||i.Runs>1000000||(i.TransitionDelay.HasValue&&(i.TransitionDelay<0||i.TransitionDelay>86400000)))throw new Exception("每個範本的執行次數須為 1～1000000。");MainForm.Validate(i.Template);if(i.Template.Steps.Count==0)throw new Exception(i.Name+" 沒有動作。");}}
+ public SequencePlan(){OuterRuns=1;OuterGap=1000;Kind="MacroSequence";Version=1;TransitionDelay=1000;Items=new List<SequenceItem>();}
+ public static void Validate(SequencePlan p){if(p==null||p.Kind!="MacroSequence"||p.Version!=1||p.Items==null||p.Items.Count>1000||p.OuterRuns<0||p.OuterRuns>1000000||p.OuterGap<0||p.OuterGap>86400000||p.TransitionDelay<0||p.TransitionDelay>86400000)throw new Exception("範本組合格式無效。");foreach(var i in p.Items){if(i==null||string.IsNullOrWhiteSpace(i.Name)||i.Runs<1||i.Runs>1000000||(i.TransitionDelay.HasValue&&(i.TransitionDelay<0||i.TransitionDelay>86400000)))throw new Exception("每個範本的執行次數須為 1～1000000。");MainForm.Validate(i.Template);if(i.Template.Steps.Count==0)throw new Exception(i.Name+" 沒有動作。");}}
 }
 public static class MacroRunner {
  public static async Task RunTemplate(Template t,int runs,CancellationToken token,Action<string> report,Func<Step,CancellationToken,Task> perform=null,Func<int,CancellationToken,Task> wait=null,Action<long> remaining=null,Action<Step,long> upcoming=null,Step following=null,int transitionDelay=0){
@@ -24,7 +24,18 @@ public static class MacroRunner {
  }
  public static async Task RunSequence(SequencePlan plan,CancellationToken token,Action<string> report,Func<Step,CancellationToken,Task> perform=null,Func<int,CancellationToken,Task> wait=null,Action<string,long> progress=null,Action<Step,long> upcoming=null){
   SequencePlan.Validate(plan);if(plan.Items.Count==0)throw new Exception("請加入範本。");wait=wait??((ms,ct)=>Task.Delay(ms,ct));
-  for(int i=0;i<plan.Items.Count;i++){token.ThrowIfCancellationRequested();var item=plan.Items[i];int transition=item.TransitionDelay??plan.TransitionDelay;string prefix="範本 "+(i+1)+" / "+plan.Items.Count+" · "+item.Name+"｜";await RunTemplate(item.Template,item.Runs,token,s=>report(prefix+s),perform,wait,n=>{if(progress!=null)progress(item.Name,n);},upcoming,i+1<plan.Items.Count?plan.Items[i+1].Template.Steps[0]:null,transition);if(i<plan.Items.Count-1){if(upcoming!=null)upcoming(plan.Items[i+1].Template.Steps[0],transition);await wait(transition,token);}}
+  for(long cycle=1;plan.OuterRuns==0||cycle<=plan.OuterRuns;cycle++){
+   bool another=plan.OuterRuns==0||cycle<plan.OuterRuns;
+   for(int i=0;i<plan.Items.Count;i++){
+    token.ThrowIfCancellationRequested();var item=plan.Items[i];bool nextItem=i<plan.Items.Count-1;
+    int transition=nextItem?(item.TransitionDelay??plan.TransitionDelay):plan.OuterGap;
+    Step next=nextItem?plan.Items[i+1].Template.Steps[0]:(another?plan.Items[0].Template.Steps[0]:null);
+    string prefix="組合循環 "+cycle+" · 範本 "+(i+1)+" / "+plan.Items.Count+" · "+item.Name+"｜";
+    await RunTemplate(item.Template,item.Runs,token,s=>report(prefix+s),perform,wait,n=>{if(progress!=null)progress(item.Name,n);},upcoming,next,transition);
+    if(nextItem){if(upcoming!=null)upcoming(next,transition);await wait(transition,token);}
+   }
+   if(another){token.ThrowIfCancellationRequested();if(upcoming!=null)upcoming(plan.Items[0].Template.Steps[0],plan.OuterGap);await wait(plan.OuterGap,token);}
+  }
  }
  static async Task Perform(Step s,CancellationToken token){
   if(s.Type=="滑鼠點擊"){
@@ -39,32 +50,32 @@ public static class MacroRunner {
 public class SequenceForm:Form {
  readonly ActionGrid grid=new ActionGrid{Dock=DockStyle.Fill,ReadOnly=false,EditMode=DataGridViewEditMode.EditProgrammatically,AllowUserToAddRows=false,AllowUserToDeleteRows=false,MultiSelect=true,SelectionMode=DataGridViewSelectionMode.FullRowSelect,AutoSizeColumnsMode=DataGridViewAutoSizeColumnsMode.Fill,RowHeadersVisible=true,RowHeadersWidth=32,BackgroundColor=Color.White};
  readonly NumericUpDown runs=new NumericUpDown{Minimum=1,Maximum=1000000,Value=1000,Width=120},gap=WaitUnits.Control(),cycleGap=WaitUnits.Control();
- readonly Label status=new Label{AutoSize=true,Text="就緒｜執行前倒數 3 秒；F10 停止整個組合"};
+ readonly Label status=new Label{AutoSize=true,Text=""};readonly NumericUpDown outerRuns=new NumericUpDown{Minimum=0,Maximum=1000000,Value=1,Width=100},outerGap=WaitUnits.Control();
  readonly List<Control> editing=new List<Control>();readonly JavaScriptSerializer json=new JavaScriptSerializer{MaxJsonLength=64*1024*1024};readonly Func<bool> canRun;readonly Func<SequenceItem,bool> editTemplate;
  readonly Label estimate=new Label{Dock=DockStyle.Top,AutoSize=true,BackColor=Color.FromArgb(225,240,255),ForeColor=Color.Black,Padding=new Padding(12,10,12,10),Margin=new Padding(0,6,0,6)};
  int defaultTransition=1000;bool syncingFields;bool rebuilding;List<SequenceItem> copiedItems=new List<SequenceItem>();
  CancellationTokenSource cancellation;
  public SequenceForm(Func<bool> ready,Func<SequenceItem,bool> edit=null){editTemplate=edit;
-  canRun=ready;Text="範本組合";Size=new Size(1240,760);MinimumSize=new Size(1180,640);StartPosition=FormStartPosition.CenterParent;Font=new Font("Microsoft JhengHei UI",10);
+  Icon=AppIdentity.Icon;canRun=ready;Text="範本組合";Size=new Size(1240,760);MinimumSize=new Size(1180,640);StartPosition=FormStartPosition.CenterParent;Font=new Font("Microsoft JhengHei UI",10);
   var layout=new TableLayoutPanel{Dock=DockStyle.Fill,RowCount=6,ColumnCount=1,Padding=new Padding(16)};Controls.Add(layout);
   layout.ColumnStyles.Add(new ColumnStyle(SizeType.Percent,100));for(int i=0;i<6;i++)layout.RowStyles.Add(new RowStyle(i==3?SizeType.Percent:SizeType.AutoSize,i==3?100:0));
   var toolbar=Row();layout.Controls.Add(toolbar);Button(toolbar,"加入範本…",AddTemplates);Button(toolbar,"載入組合…",LoadPlan);Button(toolbar,"儲存組合…",SavePlan);UpdateEstimate();
   var batch=Row();batch.WrapContents=false;batch.BackColor=Color.FromArgb(238,238,238);batch.Padding=new Padding(10,8,10,8);AddField(batch,"範本循環次數",runs);AddField(batch,"循環後等待 (sec)",cycleGap);AddField(batch,"範本切換等待 (sec)",gap);layout.Controls.Add(batch);editing.Add(cycleGap);runs.ValueChanged+=(s,e)=>ApplyField(2);cycleGap.ValueChanged+=(s,e)=>ApplyField(4);gap.ValueChanged+=(s,e)=>ApplyField(5);
   layout.Controls.Add(new Label{AutoSize=true,Dock=DockStyle.Top,Padding=new Padding(0,8,0,12),Text="依序執行每列的循環次數，例如 A × 1000 → B × 1000 → C × 500。\nCtrl／Shift 多選；拖曳調整順序；雙擊欄位直接修改。上方數值會隨選取更新，變更後立即套用至所有所選範本。"});
   foreach(string name in new[]{"順序","範本","循環次數","動作數","循環後等待 (sec)","範本切換等待 (sec)"})grid.Columns.Add(name,name);grid.Columns[3].Visible=false;grid.Columns[0].FillWeight=35;grid.Columns[1].FillWeight=200;grid.RowTemplate.Height=38;grid.ColumnHeadersHeightSizeMode=DataGridViewColumnHeadersHeightSizeMode.AutoSize;foreach(DataGridViewColumn c in grid.Columns){c.SortMode=DataGridViewColumnSortMode.NotSortable;c.MinimumWidth=70;}grid.Columns[4].MinimumWidth=175;grid.Columns[5].MinimumWidth=180;grid.Columns[5].DefaultCellStyle.Format="0.0##";grid.Columns[4].DefaultCellStyle.Format="0.0##";layout.Controls.Add(grid);SetupEditing();grid.ReorderRequested+=ReorderItems;grid.SelectionChanged+=(s,e)=>SyncFields();layout.Controls.Add(estimate);
-  var footer=Row();layout.Controls.Add(footer);Button(footer,"執行組合",async()=>await Run());var start=(Button)footer.Controls[footer.Controls.Count-1];start.Font=new Font(Font.FontFamily,14,FontStyle.Bold);start.BackColor=Color.LightGreen;start.UseVisualStyleBackColor=false;var stop=new Button{Text="停止 F10",AutoSize=true,Font=new Font(Font.FontFamily,14,FontStyle.Bold)};stop.Click+=(s,e)=>Stop();footer.Controls.Add(stop);footer.Controls.Add(status);editing.Add(grid);editing.Add(runs);editing.Add(gap);
+  var footer=Row();layout.Controls.Add(footer);AddField(footer,"循環次數（0＝持續）",outerRuns);AddField(footer,"循環後等待 (sec)",outerGap);outerRuns.ValueChanged+=(s,e)=>UpdateEstimate();outerGap.ValueChanged+=(s,e)=>UpdateEstimate();editing.Add(outerRuns);editing.Add(outerGap);Button(footer,"執行組合",async()=>await Run());var start=(Button)footer.Controls[footer.Controls.Count-1];start.Font=new Font(Font.FontFamily,14,FontStyle.Bold);start.BackColor=Color.LightGreen;start.UseVisualStyleBackColor=false;var stop=new Button{Text="停止 F10",AutoSize=true,Font=new Font(Font.FontFamily,14,FontStyle.Bold)};stop.Click+=(s,e)=>Stop();footer.Controls.Add(stop);editing.Add(grid);editing.Add(runs);editing.Add(gap);
   Shown+=(s,e)=>WarnMissingSources();FormClosing+=(s,e)=>{if(cancellation!=null){e.Cancel=true;Stop();status.Text="正在停止，完成後可關閉。";return;}if(grid.IsCurrentCellInEditMode&&!grid.EndEdit())e.Cancel=true;};
  }
  static FlowLayoutPanel Row(){return new FlowLayoutPanel{Dock=DockStyle.Top,AutoSize=true,AutoSizeMode=AutoSizeMode.GrowAndShrink,WrapContents=true,Padding=new Padding(0,4,0,4)};}
  void Button(FlowLayoutPanel row,string text,Action action){var b=new Button{Text=text,AutoSize=true};b.Click+=(s,e)=>{try{action();}catch(Exception ex){MessageBox.Show(this,ex.Message,"範本組合");}};row.Controls.Add(b);editing.Add(b);}
  public static decimal EstimateMilliseconds(SequencePlan plan){
-  if(plan.Items.Count==0)return 0;
+  if(plan.Items.Count==0)return 0;if(plan.OuterRuns==0)return -1;
   decimal total=3000;for(int i=0;i<plan.Items.Count-1;i++)total+=plan.Items[i].TransitionDelay??plan.TransitionDelay;
   foreach(var item in plan.Items){
    decimal cycle=item.Template.Steps.Sum(step=>(decimal)step.Delay+(step.Type=="等待"?0:step.Hold));
    total+=cycle*item.Runs+(decimal)item.Template.Gap*(item.Runs-1)+item.Runs;
   }
-  return total;
+  return 3000+(total-3000)*plan.OuterRuns+(decimal)plan.OuterGap*(plan.OuterRuns-1);
  }
  public static string FormatDuration(decimal milliseconds){
   decimal seconds=Math.Ceiling(milliseconds/1000m),days=Math.Floor(seconds/86400m);seconds%=86400m;
@@ -73,8 +84,8 @@ public class SequenceForm:Form {
  }
  void UpdateEstimate(){
   var items=grid.Rows.Cast<DataGridViewRow>().Select(r=>r.Tag as SequenceItem).Where(i=>i!=null).ToList();
-  var plan=new SequencePlan{TransitionDelay=defaultTransition,Items=items};
-  estimate.Text=items.Count==0?"預計總執行時間：0 秒":"預計總執行時間："+FormatDuration(EstimateMilliseconds(plan))+"（含開始前 3 秒倒數）";
+  var plan=new SequencePlan{OuterRuns=(int)outerRuns.Value,OuterGap=WaitUnits.ToMilliseconds(outerGap.Value),TransitionDelay=defaultTransition,Items=items};
+  estimate.Text=items.Count==0?"預計總執行時間：0 秒":plan.OuterRuns==0?"預計總執行時間：持續循環（按 F10 停止）":"預計總執行時間："+FormatDuration(EstimateMilliseconds(plan))+"（含開始前 3 秒倒數）";
  }
  public static SequenceItem EditCell(SequenceItem source,int column,string value){
   var item=new SequenceItem{Name=source.Name,SourcePath=source.SourcePath,Runs=source.Runs,TransitionDelay=source.TransitionDelay,Template=new Template{Gap=source.Template.Gap,Steps=source.Template.Steps.Select(MainForm.CopyStep).ToList()}};
@@ -134,11 +145,12 @@ public class SequenceForm:Form {
  void Renumber(){foreach(DataGridViewRow row in grid.Rows)Render(row);UpdateEstimate();}
  public void AddItem(SequenceItem item){int index=grid.Rows.Add();grid.Rows[index].Tag=item;Render(grid.Rows[index]);grid.ClearSelection();grid.Rows[index].Selected=true;}
  void AddTemplates(){using(var d=new OpenFileDialog{Filter="動作範本 (*.json)|*.json",Multiselect=true})if(d.ShowDialog(this)==DialogResult.OK){var items=new List<SequenceItem>();foreach(var path in d.FileNames){string data=File.ReadAllText(path);var raw=json.DeserializeObject(data) as Dictionary<string,object>;if(raw==null||raw.ContainsKey("Kind"))throw new Exception("請選擇動作範本，不能加入另一個組合。");var t=json.Deserialize<Template>(data);var item=new SequenceItem{Name=Path.GetFileNameWithoutExtension(path),SourcePath=Path.GetFullPath(path),Runs=(int)runs.Value,Template=t};SequencePlan.Validate(new SequencePlan{Items=new List<SequenceItem>{item}});items.Add(item);}foreach(var item in items)AddItem(item);}}
+ public void SetOuterLoop(int count,int milliseconds){outerRuns.Value=count;outerGap.Value=milliseconds/1000m;}
  public void SetTransition(int value){defaultTransition=value;Renumber();SyncFields();}
- public SequencePlan Current(){if(grid.IsCurrentCellInEditMode&&!grid.EndEdit())throw new Exception("請先修正正在編輯的欄位。");return new SequencePlan{TransitionDelay=defaultTransition,Items=grid.Rows.Cast<DataGridViewRow>().Select(r=>(SequenceItem)r.Tag).ToList()};}
+ public SequencePlan Current(){if(grid.IsCurrentCellInEditMode&&!grid.EndEdit())throw new Exception("請先修正正在編輯的欄位。");return new SequencePlan{OuterRuns=(int)outerRuns.Value,OuterGap=WaitUnits.ToMilliseconds(outerGap.Value),TransitionDelay=defaultTransition,Items=grid.Rows.Cast<DataGridViewRow>().Select(r=>(SequenceItem)r.Tag).ToList()};}
  void MoveItem(int delta){if(grid.SelectedRows.Count==0)return;int a=grid.SelectedRows[0].Index,b=a+delta;if(b<0||b>=grid.Rows.Count)return;object temp=grid.Rows[a].Tag;grid.Rows[a].Tag=grid.Rows[b].Tag;grid.Rows[b].Tag=temp;Renumber();grid.ClearSelection();grid.Rows[b].Selected=true;}
  void SavePlan(){var plan=Current();SequencePlan.Validate(plan);using(var d=new SaveFileDialog{Filter="範本組合 (*.sequence.json)|*.sequence.json",FileName="我的範本組合.sequence.json"})if(d.ShowDialog(this)==DialogResult.OK){string temp=d.FileName+".tmp";File.WriteAllText(temp,json.Serialize(plan),System.Text.Encoding.UTF8);if(File.Exists(d.FileName))File.Replace(temp,d.FileName,null);else File.Move(temp,d.FileName);status.Text="組合已儲存（包含各範本內容）";}}
- void LoadPlan(){using(var d=new OpenFileDialog{Filter="範本組合 (*.sequence.json)|*.sequence.json|JSON (*.json)|*.json"})if(d.ShowDialog(this)==DialogResult.OK){string data=File.ReadAllText(d.FileName);var raw=json.DeserializeObject(data) as Dictionary<string,object>;if(raw==null||!raw.ContainsKey("Kind")||Convert.ToString(raw["Kind"])!="MacroSequence")throw new Exception("請選擇範本組合檔案。");var plan=json.Deserialize<SequencePlan>(data);SequencePlan.Validate(plan);if(grid.Rows.Count>0&&MessageBox.Show(this,"取代目前組合清單？未儲存的修改將遺失。","載入組合",MessageBoxButtons.YesNo)!=DialogResult.Yes)return;defaultTransition=plan.TransitionDelay;grid.Rows.Clear();foreach(var item in plan.Items)AddItem(item);SyncFields();UpdateEstimate();status.Text="組合已載入";WarnMissingSources();}}
+ void LoadPlan(){using(var d=new OpenFileDialog{Filter="範本組合 (*.sequence.json)|*.sequence.json|JSON (*.json)|*.json"})if(d.ShowDialog(this)==DialogResult.OK){string data=File.ReadAllText(d.FileName);var raw=json.DeserializeObject(data) as Dictionary<string,object>;if(raw==null||!raw.ContainsKey("Kind")||Convert.ToString(raw["Kind"])!="MacroSequence")throw new Exception("請選擇範本組合檔案。");var plan=json.Deserialize<SequencePlan>(data);SequencePlan.Validate(plan);if(grid.Rows.Count>0&&MessageBox.Show(this,"取代目前組合清單？未儲存的修改將遺失。","載入組合",MessageBoxButtons.YesNo)!=DialogResult.Yes)return;SetOuterLoop(plan.OuterRuns,plan.OuterGap);defaultTransition=plan.TransitionDelay;grid.Rows.Clear();foreach(var item in plan.Items)AddItem(item);SyncFields();UpdateEstimate();status.Text="組合已載入";WarnMissingSources();}}
  public void Stop(){if(cancellation!=null)cancellation.Cancel();}
  async Task Run(){if(cancellation!=null)return;try{if(!canRun())throw new Exception("F10 停止熱鍵不可用，請關閉占用熱鍵的程式後重新啟動。");var plan=Current();SequencePlan.Validate(plan);if(plan.Items.Count==0)throw new Exception("請先加入範本。");cancellation=new CancellationTokenSource();foreach(var c in editing)c.Enabled=false;var token=cancellation.Token;await CountdownOverlay.Run(token,s=>status.Text=s);using(var badge=new RunBadge()){badge.Show();await MacroRunner.RunSequence(plan,token,s=>status.Text=s,progress:(name,n)=>badge.SetProgress(name,n),upcoming:badge.SetUpcoming);}status.Text="全部範本執行完成";}catch(OperationCanceledException){status.Text="已停止整個組合";}catch(Exception ex){status.Text="執行中止";MessageBox.Show(this,ex.Message,"範本組合");}finally{if(cancellation!=null){cancellation.Dispose();cancellation=null;}foreach(var c in editing)c.Enabled=true;}}
 }
