@@ -11,7 +11,8 @@ using System.Windows.Forms;
 public static class FeatureTests {
  static void Check(bool condition,string label){if(!condition)throw new Exception(label);}
  static SequenceItem Item(string name,int runs){return new SequenceItem{Name=name,Runs=runs,Template=new Template{Repeats=77,Gap=17,Steps=new List<Step>{new Step{Type="鍵盤按壓",Value=name,Hold=0,Delay=23}}}};}
- public static void Run(){TestTemplateSaving();
+ public static void Run(){ScanTests.Run();
+  TestTemplateSaving();
   TestBatchAndSeconds();
   TestLiveUI();
   TestInteraction();
