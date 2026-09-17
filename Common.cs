@@ -16,7 +16,7 @@ public class OverlayForm : Form
     protected const int HTTRANSPARENT = -1, MA_NOACTIVATE = 3;
     const int WS_EX_TRANSPARENT = 0x00000020, WS_EX_TOOLWINDOW = 0x00000080, WS_EX_NOACTIVATE = 0x08000000;
     const int GWL_EXSTYLE = -20;
-    const uint WDA_EXCLUDEFROMCAPTURE = 0x11;
+    const uint WDA_NONE = 0x00, WDA_EXCLUDEFROMCAPTURE = 0x11;
     [DllImport("user32.dll")] static extern bool SetWindowDisplayAffinity(IntPtr window, uint affinity);
     [DllImport("user32.dll")] static extern int GetWindowLong(IntPtr window, int index);
     [DllImport("user32.dll")] static extern int SetWindowLong(IntPtr window, int index, int value);
@@ -46,13 +46,25 @@ public class OverlayForm : Form
     // ScanOverlay 覆寫成「只有鎖定時穿透」，編輯模式才抓得到邊框。
     protected virtual bool ClickThrough { get { return true; } }
     // 要不要請系統把這個視窗排除在螢幕擷取之外。只有會反過來擷取螢幕的覆蓋層需要
-    //（否則會掃到自己畫上去的東西）。Win10 2004 以後才支援，失敗就忽略。
+    //（否則會掃到自己畫上去的東西）。Win10 2004 以後才支援。
     protected virtual bool ExcludeFromCapture { get { return false; } }
     protected override void OnHandleCreated(EventArgs e)
     {
         base.OnHandleCreated(e);
-        if (ExcludeFromCapture) { try { SetWindowDisplayAffinity(Handle, WDA_EXCLUDEFROMCAPTURE); } catch { } }
+        SyncCapture();
         SyncPassthrough();
+    }
+    // 把 ExcludeFromCapture 的當下結果套到視窗上，回傳「系統是否真的接受」。
+    //
+    // 回傳值很重要，不能像以前那樣 try/catch 吞掉：呼叫端要靠它決定備援。
+    // 排除擷取失敗（Win10 2004 之前的系統）時，掃描就會讀到自己畫上去的高亮，
+    // 那是會讓結果在「命中」與「沒命中」之間抽動的嚴重錯誤，不能默默發生。
+    protected bool SyncCapture()
+    {
+        if (!IsHandleCreated) return false;
+        bool wanted = ExcludeFromCapture;
+        try { return SetWindowDisplayAffinity(Handle, wanted ? WDA_EXCLUDEFROMCAPTURE : WDA_NONE) && wanted; }
+        catch { return false; }
     }
     // 除了 WM_NCHITTEST 回 HTTRANSPARENT，再從視窗樣式掛上 WS_EX_TRANSPARENT，
     // 讓整個視窗在 hit test 之前就對滑鼠完全不存在。兩層是刻意的雙保險。

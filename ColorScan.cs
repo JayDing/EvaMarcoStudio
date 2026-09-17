@@ -1,4 +1,4 @@
-using System;
+﻿using System;
 using System.Collections.Generic;
 using System.Drawing;
 using System.Drawing.Imaging;
@@ -10,13 +10,17 @@ using System.Windows.Forms;
 // 顏色掃描小工具
 //
 // 螢幕上放一個全透明、可拖曳可縮放的方塊，定時掃描方塊內的顏色，
-// 把落在容差範圍內的像素畫成高亮色塊（可閃爍），用來盯住畫面上某個顏色。
+// 把感知上足夠接近的像素畫成高亮色塊（可閃爍），用來盯住畫面上某個顏色。
 //
 // 檔案結構：
-//   ColorRule／ColorScanner  色碼解析、對比色計算與純粹的像素比對，不碰 UI，可單獨測試
+//   ColorRule                一組色碼設定（使用者輸入的字串形式），與色碼解析、對比色計算
+//   Perceptual               sRGB ↔ CIELAB 與感知距離 ΔE，註解裡記了為什麼比對要用它
+//   ColorMatch               把 ColorRule 編譯成 Lab 座標的比對器
+//   ColorScanner             純粹的像素比對，不碰 UI，可單獨測試
 //   ScanOverlay              螢幕上那個方塊：兩種模式、定時掃描、繪製高亮
 //   ColorBubble／ColorPicker 吸色：跟著游標的小色票，以及等待點擊的全域鉤子
-//   ColorRuleRow             一列色碼組（目標色碼／容差；高亮色自動算）
+//   ColorRuleRow             一列色碼組（色碼／誤差 ΔE；高亮色自動算）
+//   TolerancePreview／ToleranceForm  誤差極限預覽：把誤差邊界上的顏色畫出來
 //   ScanProfile／ScanSession 設定的驗證與自動保存
 //   ScanStudioForm           工具視窗，把上面這些接起來
 //
@@ -26,14 +30,25 @@ using System.Windows.Forms;
 //   編輯模式  藍色邊框可拖曳移動、四角可縮放
 //   鎖定      方塊完全固定，且對滑鼠完全穿透，點擊與拖曳全部傳到下方程式
 // 按 F7 開始掃描會自動鎖定，F8 結束掃描會回到編輯模式。
-// 一組色碼設定：要找的顏色，以及這一組自己的容差。
+// 一組色碼設定：要找的顏色，以及這一組自己的誤差。
 // 高亮色不必設定，一律由 Contrast() 從目標色算出對比色。
-// 目標色以字串保存使用者輸入，因為輸入途中會有「半成品」，不該在那一刻就報錯。
+//
+// Target 以字串保存使用者輸入，因為輸入途中會有「半成品」，不該在那一刻就報錯。
+//
+// Tolerance 是 Lab 空間的感知距離 ΔE，不是通道差也不是角度——理由寫在 Perceptual 的註解裡。
+//
+// 一組只有一個顏色，沒有「多重樣本」。真的要同時盯住好幾個顏色就開好幾組——
+// 每一組有自己的誤差和自己的高亮色，比幾個樣本共用一個高亮色更好用，
+// 而色碼組本來就能開到 20 組。
+//
+// 注意：Tolerance 的單位在改版時換過。舊設定檔裡它是「通道差」（預設 24），
+// 現在會被當成 ΔE 24 讀進來 —— 那已經超過 ΔE 的破圖上限 15，會掃出一堆雜點。
+// 舊檔不會壞、也不會掉資料，但升級後第一次用一定要重新調誤差值。
 public class ColorRule
 {
     public string Target { get; set; }
     public int Tolerance { get; set; }
-    public ColorRule() { Target = "#FF0000"; Tolerance = 24; }
+    public ColorRule() { Target = "#FF0000"; Tolerance = ColorMatch.DefaultTolerance; }
     // 高亮色＝目標色的對比色：色相轉 180°、彩度拉滿，亮度往反方向拉。
     // 近灰階算不出有意義的互補色（互補後還是灰），就依明暗改用固定的亮綠或洋紅。
     // 這樣算出來的顏色和目標色在 RGB 上一定差得很遠，也順便避免掃描自我回饋。
@@ -76,8 +91,219 @@ public class ColorRule
         return Color.FromArgb(255, named);
     }
     public static string Format(Color c) { return "#" + c.R.ToString("X2") + c.G.ToString("X2") + c.B.ToString("X2"); }
-    public static void Validate(ColorRule rule) { if (rule == null) throw new Exception("色碼組無效。"); Parse(rule.Target); if (rule.Tolerance < 0 || rule.Tolerance > 255) throw new Exception("容差需介於 0～255。"); }
+    // Tolerance 的範圍由 ColorMatch 定義（ΔE 0～100），驗證、夾取與欄位上下限都引用同一組常數。
+    public static void Validate(ColorRule rule)
+    {
+        if (rule == null) throw new Exception("色碼組無效。");
+        Parse(rule.Target);
+        if (rule.Tolerance < ColorMatch.MinTolerance || rule.Tolerance > ColorMatch.MaxTolerance)
+            throw new Exception("誤差需介於 " + ColorMatch.MinTolerance + "～" + ColorMatch.MaxTolerance + "。");
+    }
     public ColorRule Copy() { return new ColorRule { Target = Target, Tolerance = Tolerance }; }
+}
+// 感知色彩：sRGB → CIELAB，以及 Lab 空間裡的距離（ΔE）。
+//
+// 為什麼整個比對改用 Lab 而不是色相或 RGB 通道差：
+//
+//   RGB 通道差是「加法」的盒子，而遊戲的光影是「乘法」的縮放，兩者對不上。
+//   色相看起來像是解法，但它在暗色與低彩度區域會嚴重誤導——實測同一件皮革的染色色碼
+//   與它在畫面上的顏色色相差了 90 度，用色相衡量會判定為完全不同的顏色；
+//   同一組顏色在 Lab 裡只差 ΔE 12，也就是「看得出差別但明顯協調」。
+//   原因是暗色低彩度的區域裡色相根本不影響觀感，拿它當主要指標等於放大了一個不重要的維度。
+//
+//   Lab 是為了「數值距離對應人眼感受」而設計的，所以一個 ΔE 門檻同時管好色相、彩度與明暗
+//   的取捨，不必讓使用者分開調三個數字，也讓染色色盤上的色碼可以直接當掃描目標。
+//
+// ΔE 用的是 CIEDE2000。一開始為了省計算選了 CIE76，那是錯的——理由寫在 Squared() 上面。
+public static class Perceptual
+{
+    // sRGB 的 gamma 展開。每個通道只有 256 種可能值，所以這張表是「完全精確」的查表，
+    // 不是近似。真正需要每個像素重算的只剩三個立方根。
+    static readonly float[] Expand = BuildExpand();
+    static float[] BuildExpand()
+    {
+        var table = new float[256];
+        for (int i = 0; i < 256; i++)
+        {
+            double u = i / 255.0;
+            table[i] = (float)(u <= 0.04045 ? u / 12.92 : Math.Pow((u + 0.055) / 1.055, 2.4));
+        }
+        return table;
+    }
+    // D65 白點。
+    const double Xn = 0.95047, Yn = 1.0, Zn = 1.08883;
+    // 刻意不做「把 RGB 量化成 32×32×32 再查 Lab」這種加速：實測那樣的量化誤差平均 ΔE 2.2、
+    // 最大 ΔE 7.7（暗色更差，最大 8.0），而預設門檻只有 12——誤差和門檻同一個數量級，
+    // 等於讓比對結果變成隨機。64×64×64 也還有最大 ΔE 3.8。所以 Lab 一律精確計算。
+    public static void ToLab(int argb, out float L, out float a, out float b)
+    {
+        float r = Expand[(argb >> 16) & 255], g = Expand[(argb >> 8) & 255], bl = Expand[argb & 255];
+        double X = r * 0.4124 + g * 0.3576 + bl * 0.1805;
+        double Y = r * 0.2126 + g * 0.7152 + bl * 0.0722;
+        double Z = r * 0.0193 + g * 0.1192 + bl * 0.9505;
+        double fx = Pivot(X / Xn), fy = Pivot(Y / Yn), fz = Pivot(Z / Zn);
+        L = (float)(116.0 * fy - 16.0);
+        a = (float)(500.0 * (fx - fy));
+        b = (float)(200.0 * (fy - fz));
+    }
+    static double Pivot(double t) { return t > 0.008856 ? Math.Pow(t, 1.0 / 3.0) : 7.787 * t + 16.0 / 116.0; }
+    static double Unpivot(double t) { double cube = t * t * t; return cube > 0.008856 ? cube : (t - 16.0 / 116.0) / 7.787; }
+    public static void ToLab(Color colour, out float L, out float a, out float b) { ToLab(colour.ToArgb(), out L, out a, out b); }
+    // Lab → sRGB。給誤差預覽用：要畫出「剛好在 ΔE 門檻上」的顏色就得反算回來。
+    // 超出 sRGB 能表現的範圍時直接夾住，夾過的顏色距離會改變，所以預覽那邊仍然要實測距離。
+    public static Color FromLab(float L, float a, float b)
+    {
+        double fy = (L + 16.0) / 116.0, fx = fy + a / 500.0, fz = fy - b / 200.0;
+        double X = Unpivot(fx) * Xn, Y = Unpivot(fy) * Yn, Z = Unpivot(fz) * Zn;
+        double r = X * 3.2406 + Y * -1.5372 + Z * -0.4986;
+        double g = X * -0.9689 + Y * 1.8758 + Z * 0.0415;
+        double bl = X * 0.0557 + Y * -0.2040 + Z * 1.0570;
+        return Color.FromArgb(255, Compress(r), Compress(g), Compress(bl));
+    }
+    static int Compress(double channel)
+    {
+        double value = channel <= 0.0031308 ? channel * 12.92 : 1.055 * Math.Pow(Math.Max(0.0, channel), 1.0 / 2.4) - 0.055;
+        return Math.Max(0, Math.Min(255, (int)Math.Round(value * 255.0)));
+    }
+    // CIEDE2000（ΔE00）。
+    //
+    // 一開始用的是 CIE76（Lab 的直線距離），註解裡還寫著「在這個工具關心的距離範圍兩者判斷
+    // 一致」——那是沒驗證過的假設，而且是錯的。實測布的染色色碼到它的畫面顏色，CIE76 算 7.8、
+    // CIEDE2000 只有 4.7，差了四成。這個差距直接決定預設值能不能用：4.7 讓預設 6 成立，
+    // 7.8 則會讓「填色碼掃自己那件東西」在預設值下失敗。
+    //
+    // CIEDE2000 存在的理由正是修正 CIE76 在藍色與暗色區域的偏差，而遊戲材質幾乎都落在那裡，
+    // 所以這裡沒有選便宜那個的空間。
+    //
+    // 回傳距離的平方交給 Hit 比較（省掉一次開根號），要實際數值的呼叫端用 Distance()。
+    static float Squared(float L1, float a1, float b1, float L2, float a2, float b2)
+    {
+        double C1 = Math.Sqrt(a1 * a1 + b1 * b1), C2 = Math.Sqrt(a2 * a2 + b2 * b2);
+        double Cb = (C1 + C2) / 2.0;
+        double Cb7 = Cb * Cb * Cb; Cb7 = Cb7 * Cb7 * Cb;          // Cb 的七次方，不用 Math.Pow
+        double G = Cb > 0 ? 0.5 * (1.0 - Math.Sqrt(Cb7 / (Cb7 + Pow25_7))) : 0.0;
+        double a1p = (1.0 + G) * a1, a2p = (1.0 + G) * a2;
+        double C1p = Math.Sqrt(a1p * a1p + b1 * b1), C2p = Math.Sqrt(a2p * a2p + b2 * b2);
+        double h1 = Angle(b1, a1p), h2 = Angle(b2, a2p);
+        double dLp = L2 - L1, dCp = C2p - C1p;
+        double dhp;
+        if (C1p * C2p == 0.0) dhp = 0.0;
+        else if (Math.Abs(h2 - h1) <= 180.0) dhp = h2 - h1;
+        else if (h2 - h1 > 180.0) dhp = h2 - h1 - 360.0;
+        else dhp = h2 - h1 + 360.0;
+        double dHp = 2.0 * Math.Sqrt(C1p * C2p) * Math.Sin(ToRadians(dhp) / 2.0);
+        double Lbp = (L1 + L2) / 2.0, Cbp = (C1p + C2p) / 2.0;
+        double hbp;
+        if (C1p * C2p == 0.0) hbp = h1 + h2;
+        else if (Math.Abs(h1 - h2) <= 180.0) hbp = (h1 + h2) / 2.0;
+        else if (h1 + h2 < 360.0) hbp = (h1 + h2 + 360.0) / 2.0;
+        else hbp = (h1 + h2 - 360.0) / 2.0;
+        double T = 1.0
+            - 0.17 * Math.Cos(ToRadians(hbp - 30.0))
+            + 0.24 * Math.Cos(ToRadians(2.0 * hbp))
+            + 0.32 * Math.Cos(ToRadians(3.0 * hbp + 6.0))
+            - 0.20 * Math.Cos(ToRadians(4.0 * hbp - 63.0));
+        double offset = (hbp - 275.0) / 25.0;
+        double dTheta = 30.0 * Math.Exp(-(offset * offset));
+        double Cbp7 = Cbp * Cbp * Cbp; Cbp7 = Cbp7 * Cbp7 * Cbp;
+        double Rc = Cbp > 0 ? 2.0 * Math.Sqrt(Cbp7 / (Cbp7 + Pow25_7)) : 0.0;
+        double light = Lbp - 50.0;
+        double Sl = 1.0 + (0.015 * light * light) / Math.Sqrt(20.0 + light * light);
+        double Sc = 1.0 + 0.045 * Cbp, Sh = 1.0 + 0.015 * Cbp * T;
+        double Rt = -Math.Sin(ToRadians(2.0 * dTheta)) * Rc;
+        double l = dLp / Sl, c = dCp / Sc, h = dHp / Sh;
+        return (float)(l * l + c * c + h * h + Rt * c * h);
+    }
+    const double Pow25_7 = 6103515625.0;   // 25^7
+    static double ToRadians(double degrees) { return degrees * Math.PI / 180.0; }
+    static double Angle(double y, double x)
+    {
+        if (x == 0.0 && y == 0.0) return 0.0;
+        double degrees = Math.Atan2(y, x) * 180.0 / Math.PI;
+        return degrees < 0.0 ? degrees + 360.0 : degrees;
+    }
+    // 明度差本身就是 ΔE00 的下界：ΔE00 ≥ |ΔL| / Sl，而 Sl 最大約 1.75（明度在 0 或 100 時）。
+    // 所以 |ΔL| 超過 1.75 倍門檻的像素一定不命中，可以在算完整公式之前就丟掉。
+    // 這是精確的提前退出，不是近似——不會漏掉任何該命中的像素。
+    public const float LightnessBound = 1.75f;
+    public static float DistanceSquared(float L1, float a1, float b1, float L2, float a2, float b2)
+    {
+        return Squared(L1, a1, b1, L2, a2, b2);
+    }
+    public static float Distance(float L1, float a1, float b1, float L2, float a2, float b2)
+    {
+        return (float)Math.Sqrt(Math.Max(0f, Squared(L1, a1, b1, L2, a2, b2)));
+    }
+    public static float Distance(Color one, Color other)
+    {
+        float L1, a1, b1, L2, a2, b2;
+        ToLab(one, out L1, out a1, out b1); ToLab(other, out L2, out a2, out b2);
+        return Distance(L1, a1, b1, L2, a2, b2);
+    }
+}
+// 把 ColorRule（字串）編譯成比對器（Lab 座標）。掃描迴圈裡不該再解析色碼或重算 Lab，
+// 所以樣本的 Lab 在建構時就算完。
+//
+// 一組一個顏色配一個 ΔE 門檻。實測染色色盤上的色碼到它在畫面上的顏色最多 ΔE 5.6，
+// 所以填色碼就能直接掃到東西，不必先吸色。
+public class ColorMatch
+{
+    // 誤差的上下限。ΔE 100 已經是「幾乎任何顏色都算命中」，再往上沒有意義。
+    public const int MinTolerance = 0, MaxTolerance = 100;
+    // 預設誤差。這個工具的主要用法是「填一個色碼，找畫面上那一件東西」，所以預設值要
+    // 剛好夠蓋住同一件東西在畫面上的深淺，不要更寬。
+    //
+    // 實測色碼到它自己畫面顏色的距離：布 4.71、皮革 5.57、金屬 2.05 —— 所以 6。
+    // 不要設 5：那樣皮革會差 0.57 漏掉自己那件東西。
+    //
+    // 上面有個天花板，比一般人猜的低很多：以布為中心，一個跟它毫無關係的中性深灰
+    // #474747 只有 15.7，暗處的金屬 17.4。也就是說誤差開到 16 就會開始命中介面、
+    // 陰影、地面那種灰。誤差不是越大越安全，往上開的空間很窄。
+    //
+    // 曾經預設 12，是為了讓一個色碼同時掃到別種材質上顏色相近的裝備（布的 #2E3045
+    // 到皮革的 #002A4B 是 10.0）。那個用法拿掉了：它只在這一對材質上成立，金屬離
+    // 另外兩個 38 以上、遠超天花板，怎麼調都跨不過去，留著只會讓人誤以為誤差開大就能配色。
+    public const int DefaultTolerance = 6;
+    readonly float targetL, targetA, targetB;
+    readonly float tolerance;
+    public readonly Color Target;
+    // 高亮色跟著比對器走，不另外存一條平行清單——兩份資料就沒有不同步的可能。
+    public readonly Color Highlight;
+    public static ColorMatch Compile(ColorRule rule)
+    {
+        if (rule == null) throw new Exception("色碼組無效。");
+        return new ColorMatch(ColorRule.Parse(rule.Target), rule.Tolerance);
+    }
+    public ColorMatch(Color target, int tolerance)
+    {
+        Target = target;
+        Highlight = ColorRule.Contrast(target);
+        this.tolerance = Math.Max(MinTolerance, Math.Min(MaxTolerance, tolerance));
+        Perceptual.ToLab(target, out targetL, out targetA, out targetB);
+    }
+    public float Tolerance { get { return tolerance; } }
+    // 每一個取樣像素都會走到這裡。Lab 由呼叫端算好傳進來，一個像素只算一次，不管有幾組規則。
+    //
+    // 先用明度差做精確的提前退出（見 Perceptual.LightnessBound），絕大多數像素在這一行就
+    // 被擋掉，不必跑完整的 CIEDE2000。比的是距離的平方，再省掉一次開根號。
+    public bool Hit(float L, float a, float b)
+    {
+        if (Math.Abs(L - targetL) > tolerance * Perceptual.LightnessBound) return false;
+        return Perceptual.DistanceSquared(L, a, b, targetL, targetA, targetB) <= tolerance * tolerance;
+    }
+    // 單點測試用（預覽、規則重疊檢查、測試），自己算 Lab。
+    public bool Hit(Color colour)
+    {
+        float L, a, b; Perceptual.ToLab(colour, out L, out a, out b);
+        return Hit(L, a, b);
+    }
+    // 這個顏色離目標色多遠。預覽與診斷用，比「命中／不命中」多了程度資訊。
+    public float DistanceTo(Color colour)
+    {
+        float L, a, b; Perceptual.ToLab(colour, out L, out a, out b);
+        return Perceptual.Distance(L, a, b, targetL, targetA, targetB);
+    }
+    internal void Lab(out float L, out float a, out float b) { L = targetL; a = targetA; b = targetB; }
 }
 // 一塊要畫的高亮：Bounds 是相對掃描範圍左上角的座標，Rule 是命中的色碼組序號。
 public class ScanHit
@@ -87,38 +313,48 @@ public class ScanHit
 // 一次掃描的結果。Counts／Centers 以色碼組為索引，Centers 是命中格子的重心（相對掃描範圍）。
 public class ScanResult
 {
-    public List<ScanHit> Hits = new List<ScanHit>(); public int[] Counts = new int[0]; public Point[] Centers = new Point[0]; public int Cell = 1;
+    public List<ScanHit> Hits = new List<ScanHit>(); public int[] Counts = new int[0]; public Point[] Centers = new Point[0];
     public int Total { get { return Counts.Sum(); } }
 }
 // 純粹的像素比對，完全不碰 UI 也不碰螢幕，所以可以直接餵陣列做單元測試。
 public static class ColorScanner
 {
     // 取 R／G／B 三個通道中最大的差值（Chebyshev 距離）。
-    // 比歐氏距離直覺：容差 30 就是「每個通道都不差超過 30」。
+    //
+    // 比對已經不用這個了（Lab 距離取代了它）。留著只為一件事：自動對比色除了要感知上顯眼，
+    // 還要在 RGB 通道上和目標色差得夠遠，因為掃描讀的是原始像素值——高亮若在通道上太接近
+    // 目標色，掃描就會把自己畫的東西當成命中。那是一個關於「像素值」的條件，不是關於觀感的，
+    // 所以用通道差表達才對。
     public static int Difference(int argb, Color target) { int r = (argb >> 16) & 255, g = (argb >> 8) & 255, b = argb & 255; return Math.Max(Math.Abs(r - target.R), Math.Max(Math.Abs(g - target.G), Math.Abs(b - target.B))); }
     // 以 sample 為間隔走訪像素，命中的取樣點歸進 block 網格，
     // 再把同一列相鄰的格子併成一個矩形，大幅減少要畫的矩形數量。
     //
     // 一個格子只認第一個命中的色碼組（由上往下），結果才穩定。
-    // 副作用是：上方色碼組的容差若已涵蓋下方那組的目標色，下方那組就永遠不會有命中，
-    // 介面上的提示文字有說明這件事。
-    public static ScanResult Scan(int[] pixels, int width, int height, IList<Color> targets, IList<int> tolerances, int sample, int block)
+    // 副作用是：上方色碼組的誤差若已涵蓋下方那組的樣本色，下方那組就永遠不會有命中。
+    // 介面上的提示文字有說明，誤差預覽視窗還會把實際重疊的組別算出來講明。
+    //
+    // 收 ColorMatch 清單而不是「目標色清單＋誤差清單」：兩條平行清單長度可能不一致，
+    // 那是隨時可能發生的執行期錯誤；併成一條之後那種錯誤在結構上就不存在了。
+    public static ScanResult Scan(int[] pixels, int width, int height, IList<ColorMatch> matches, int sample, int block)
     {
-        if (pixels == null || targets == null || tolerances == null) throw new Exception("掃描參數不完整。");
-        if (targets.Count != tolerances.Count) throw new Exception("色碼組與容差數量不一致。");
+        if (pixels == null || matches == null) throw new Exception("掃描參數不完整。");
         if (width <= 0 || height <= 0 || pixels.Length < width * height) throw new Exception("掃描區域資料不完整。");
         if (sample < 1) sample = 1; if (block < 1) block = 1;
-        int rules = targets.Count, cols = (width + block - 1) / block, rows = (height + block - 1) / block;
+        int rules = matches.Count, cols = (width + block - 1) / block, rows = (height + block - 1) / block;
         var cells = new int[cols * rows]; for (int i = 0; i < cells.Length; i++) cells[i] = -1;
-        var result = new ScanResult { Counts = new int[rules], Centers = new Point[rules], Cell = block };
+        var result = new ScanResult { Counts = new int[rules], Centers = new Point[rules] };
         if (rules == 0) return result;
+        for (int r = 0; r < rules; r++) if (matches[r] == null) throw new Exception("色碼組無效。");
+        // Lab 一個像素只算一次，不管有幾組規則——那是這個迴圈裡唯一貴的動作（三個立方根）。
+        // 而且只有真的要比對的取樣點才算：已經被別的規則佔走的格子直接跳過。
         for (int y = 0; y < height; y += sample)
         {
             int row = y * width, cellRow = (y / block) * cols;
             for (int x = 0; x < width; x += sample)
             {
-                int index = cellRow + x / block; if (cells[index] >= 0) continue; int argb = pixels[row + x];
-                for (int r = 0; r < rules; r++) if (Difference(argb, targets[r]) <= tolerances[r]) { cells[index] = r; break; }
+                int index = cellRow + x / block; if (cells[index] >= 0) continue;
+                float L, a, b; Perceptual.ToLab(pixels[row + x], out L, out a, out b);
+                for (int r = 0; r < rules; r++) if (matches[r].Hit(L, a, b)) { cells[index] = r; break; }
             }
         }
         var sumX = new long[rules]; var sumY = new long[rules];
@@ -149,23 +385,31 @@ public class ScanOverlay : OverlayForm
 {
     // ───────────────────────── 設定：由工具視窗填入 ─────────────────────────
 
-    // 要找的顏色與各自的容差，兩份清單以索引對應。Highlights 是對應的高亮色。
-    public List<Color> Targets = new List<Color>();
-    public List<int> Tolerances = new List<int>();
+    // 編譯好的比對器，每組一個。高亮色從比對器自己身上取，順手快取成繪製用的色盤——
+    // 以前是兩條平行清單，那種結構隨時可能長度不一致；現在不可能。
+    List<ColorMatch> matches = new List<ColorMatch>();
     List<Color> highlights = new List<Color>();
-    public List<Color> Highlights
+    public List<ColorMatch> Matches
     {
-        get { return highlights; }
-        set { highlights = value ?? new List<Color>(); }
+        get { return matches; }
+        set
+        {
+            matches = value ?? new List<ColorMatch>();
+            highlights = matches.Select(m => m.Highlight).ToList();
+        }
     }
     // Sample：每隔幾個像素取樣一次，越大越省 CPU 但越容易漏掉細小色塊。
     // Block：命中像素歸進多大的網格，也就是畫出來的高亮色塊尺寸。
     public int Sample = DefaultSample, Block = DefaultBlock;
-    public const int DefaultSample = 1, DefaultBlock = 1;
+    // 取樣間隔 1＝每個像素都看，不漏任何細小色塊；色塊大小 3 是「看得到」與「畫得準」的折衷：
+    // 1 px 的高亮在畫面上幾乎看不見，太大則會蓋過目標本身的輪廓。
+    public const int DefaultSample = 1, DefaultBlock = 3;
     // 掃描間隔的預設值，同時也是下限 —— 欄位下限、Interval 的夾取、ScanProfile 的驗證
-    // 全部引用這一個常數。閃爍頻率是 1 /（2 × 間隔），所以這個值決定了閃爍最快能多快：
+    // 全部引用這一個常數。
+    //
+    // 為什麼有下限：閃爍開啟時亮暗各佔一個間隔，所以閃爍頻率是 1 /（2 × 間隔），
     // 500 ms 對應 1 Hz。再低下去閃爍會快到看不舒服，暗相位也可能短到 DWM 來不及重新合成
-    // （掃描就會讀到自己的殘影）。要更快的掃描就關掉閃爍。
+    // （掃描就會讀到自己的殘影）。關掉閃爍改走排除擷取，沒有暗相位，掃描頻率就是間隔本身。
     public const int DefaultInterval = 500;
 
     // ───────────────────────── 結果：回報給工具視窗 ─────────────────────────
@@ -218,57 +462,82 @@ public class ScanOverlay : OverlayForm
 
     // ───────────────────────── 亮暗相位機：掃描的核心 ─────────────────────────
     //
-    // 一個掃描間隔分成兩段，由同一個計時器輪流驅動：
+    // 高亮色塊正好蓋在它偵測到的那些像素上，所以「掃描讀不到自己畫的東西」是必要條件。
+    // 若讀得到，下一次就會讀到高亮色而不是目標色，命中隨即消失、再下一次又出現——
+    // 色塊會抽動，回報的命中數也會在真實值和 0 之間跳。
     //
-    //   亮相位   畫高亮色塊
-    //   暗相位   什麼都不畫（所以看到的是底下的原色），相位結束時才掃描
+    // 有兩種辦法達成這件事，而它們的取捨正好相反，所以「高亮閃爍」這個選項就是在兩者之間選：
     //
-    // 一個機制兩用：
-    //   對人來說，亮／暗交替就是閃爍
-    //   對掃描來說，暗相位的畫面上沒有我們自己的東西，讀到的是乾淨底圖
+    //   閃爍開啟   靠「那一刻真的沒畫」。一個間隔分成亮、暗兩段，只在暗相位掃描。
+    //              對人來說亮／暗交替就是閃爍；好處是使用者自己截圖拍得到高亮。
     //
-    // 為什麼需要這樣：高亮色塊正好蓋在它偵測到的那些像素上。若掃描讀得到自己畫上去的
-    // 東西，下一次就會讀到高亮色而不是目標色，命中隨即消失、再下一次又出現——色塊會
-    // 抽動，回報的命中數也會在真實值和 0 之間跳。
+    //   閃爍關閉   靠 WDA_EXCLUDEFROMCAPTURE 請系統把這個視窗排除在螢幕擷取之外。
+    //              掃描讀不到自己，就完全不必閃暗相位——畫面全程穩定，掃描頻率也不必打折。
+    //              代價是那個旗標分不出「誰在擷取」，使用者自己截圖也拍不到高亮。
     //
-    // 為什麼不用 WDA_EXCLUDEFROMCAPTURE：那個旗標同樣能讓掃描讀不到自己，但它是整個
-    // 視窗的設定，無法區分「誰在擷取」，連使用者自己的截圖也會拍不到高亮。靠「那一刻
-    // 真的沒畫」達成，截圖工具就拍得到。
+    // 為什麼一定要這樣分：先前兩種模式都走暗相位，只是長度不同（閃爍開＝各半個週期、
+    // 閃爍關＝只留 40ms）。結果是關掉閃爍反而「閃得更快」——暗相位變短同時也讓週期變短，
+    // 於是 1 Hz 變成 2 Hz，還配上一個 40ms 的黑閃，比開著閃爍更刺眼。
+    // 那個選項的名字和行為完全對不上，所以現在關閉就是真的不閃。
     //
-    // 兩種模式的相位長度：
-    //
-    //   閃爍開啟   亮、暗各佔一個完整的掃描間隔 → 閃爍週期是 2 × Interval
-    //   閃爍關閉   只留 BlankWindow 這個掃描必需的最小空白 → 週期就是 Interval
-    //
-    // 所以開啟閃爍會讓掃描頻率減半。這是必然的取捨：閃爍要慢到看得舒服，暗相位就得夠長，
-    // 而掃描只能在暗相位進行。需要高頻掃描就把閃爍關掉。
+    // 排除擷取失敗時（Win10 2004 之前的系統）會自動退回暗相位那條路並回報，
+    // 因為「讀到自己」是不能默默發生的錯誤。
     //
     // 上一輪沒有任何命中時畫面本來就是乾淨的，那一輪直接跳過暗相位，
     // 所以「什麼都沒找到」的情況完全沒有閃爍也沒有頻率損失。
 
     // 暗相位至少要這麼長，才夠 DWM 把「不畫」重新合成完畢。
     public const int BlankWindow = 40;
-    // 使用者設定的掃描間隔是「一整個週期」，內含尾端的暗相位。
+    // 排除擷取生效時不需要暗相位。這個欄位記的是「系統真的接受了」，不是「我們想要」。
+    bool excluded;
+    // 掃描間隔。
     public int Interval
     {
         get { return interval; }
         set { interval = Math.Max(DefaultInterval, value); if (!blank) timer.Interval = LitLength; }
     }
-    // 閃爍＝亮、暗各給一個完整的掃描間隔；關閉就只留掃描必需的最小空白。
+    // 閃爍開＝走暗相位（截圖拍得到）；閃爍關＝排除擷取（完全不閃）。
     public bool Blink
     {
         get { return blink; }
-        set { if (blink == value) return; blink = value; if (!blank) timer.Interval = LitLength; Invalidate(); }
+        set
+        {
+            if (blink == value) return;
+            blink = value;
+            excluded = SyncCapture();
+            if (blank && !NeedsBlanking) { blank = false; }
+            if (!blank) timer.Interval = LitLength;
+            Invalidate();
+        }
     }
+    protected override bool ExcludeFromCapture { get { return !blink; } }
+    // 視窗剛建立時 OverlayForm 已經套過一次排除擷取，但只有它知道系統接不接受，
+    // 所以這裡再問一次把結果記下來——不然第一次掃描會用到錯的 excluded 值。
+    protected override void OnHandleCreated(EventArgs e)
+    {
+        base.OnHandleCreated(e);
+        excluded = SyncCapture();
+    }
+    // 系統沒接受排除擷取時，只能退回暗相位——否則掃描會讀到自己。
+    internal bool NeedsBlanking { get { return blink || !excluded; } }
+    // 排除擷取生效時完全不進暗相位，所以這兩個長度只在需要暗相位時才有意義。
     internal int BlankLength { get { return blink ? interval : BlankWindow; } }
-    internal int LitLength { get { return blink ? interval : Math.Max(20, interval - BlankWindow); } }
+    internal int LitLength { get { return !NeedsBlanking ? interval : (blink ? interval : Math.Max(20, interval - BlankWindow)); } }
     // 當下該用哪組顏色畫：暗相位回傳空色盤，OnPaint 就什麼都不畫。
     public IList<Color> Phase { get { return blank ? NoColours : highlights; } }
     internal bool Blanked { get { return blank; } }
     // 相位判斷抽成純函式，方便測試釘住「有命中就必須先清空才掃描」這個性質。
-    internal static bool NeedsBlank(int hitCount, bool alreadyBlank) { return !alreadyBlank && hitCount > 0; }
+    // needsBlanking 為假（排除擷取生效）時永遠不必清空。
+    internal static bool NeedsBlank(int hitCount, bool alreadyBlank, bool needsBlanking)
+    {
+        return needsBlanking && !alreadyBlank && hitCount > 0;
+    }
     // 測試用：直接擺一組命中結果進來，好驗證相位機的行為，不必真的去擷取螢幕。
     internal void SeedHits(params ScanHit[] value) { Hits = new List<ScanHit>(value); }
+    // 測試用：假裝系統接受了排除擷取。
+    // 沒有這個鉤子就測不到「完全不閃」那條路——測試裡的方塊從來沒 Show() 過，
+    // 沒有視窗句柄，SetWindowDisplayAffinity 一定失敗，於是永遠只走得到備援路徑。
+    internal void SimulateCaptureExcluded(bool value) { excluded = value; if (!blank) timer.Interval = LitLength; }
     // ApplyRules() 每次按鍵都會設定 Scanning，所以沒變就直接返回，
     // 否則沒在掃描時每敲一個字都白跑一次清空與重繪。
     public bool Scanning
@@ -277,14 +546,14 @@ public class ScanOverlay : OverlayForm
         set
         {
             if (value == timer.Enabled) return;
-            if (value) { blank = false; timer.Interval = LitLength; timer.Start(); }
+            if (value) { excluded = SyncCapture(); blank = false; timer.Interval = LitLength; timer.Start(); }
             else { timer.Stop(); blank = false; Hits = new List<ScanHit>(); Invalidate(); }
         }
     }
     // 計時器的每一拍：該進暗相位就先清空畫面，已經在暗相位就真的掃描。
     internal void Step()
     {
-        if (NeedsBlank(Hits.Count, blank))
+        if (NeedsBlank(Hits.Count, blank, NeedsBlanking))
         {
             // 先把「不畫」送上畫面，接下來這段空窗留給 DWM 重新合成。
             blank = true; timer.Interval = BlankLength; Invalidate(); if (IsHandleCreated) Update(); return;
@@ -295,9 +564,10 @@ public class ScanOverlay : OverlayForm
     }
     // 手動掃描一次（「立即掃描一次」按鈕）。畫面上可能正畫著上一輪的色塊，
     // 所以先清掉、讓它真的上畫面、等合成追上，再讀。
+    // 排除擷取生效時讀不到自己，這一段可以整個跳過。
     public void ScanOnce()
     {
-        if (Hits.Count > 0 && IsHandleCreated)
+        if (NeedsBlanking && Hits.Count > 0 && IsHandleCreated)
         {
             blank = true; Invalidate(); Update();
             System.Threading.Thread.Sleep(BlankWindow);
@@ -311,7 +581,7 @@ public class ScanOverlay : OverlayForm
     void Read()
     {
         var area = ScanArea;
-        if (area.Width < 1 || area.Height < 1 || Targets.Count == 0) { if (Hits.Count > 0) { Hits = new List<ScanHit>(); Invalidate(); } return; }
+        if (area.Width < 1 || area.Height < 1 || Matches.Count == 0) { if (Hits.Count > 0) { Hits = new List<ScanHit>(); Invalidate(); } return; }
         try
         {
             if (buffer == null || buffer.Width != area.Width || buffer.Height != area.Height) { if (buffer != null) buffer.Dispose(); buffer = new Bitmap(area.Width, area.Height, PixelFormat.Format32bppArgb); pixels = new int[area.Width * area.Height]; }
@@ -319,7 +589,7 @@ public class ScanOverlay : OverlayForm
             var data = buffer.LockBits(new Rectangle(0, 0, area.Width, area.Height), ImageLockMode.ReadOnly, PixelFormat.Format32bppArgb);
             try { for (int y = 0; y < area.Height; y++) Marshal.Copy(new IntPtr(data.Scan0.ToInt64() + (long)y * data.Stride), pixels, y * area.Width, area.Width); }
             finally { buffer.UnlockBits(data); }
-            var result = ColorScanner.Scan(pixels, area.Width, area.Height, Targets, Tolerances, Sample, Block);
+            var result = ColorScanner.Scan(pixels, area.Width, area.Height, Matches, Sample, Block);
             Hits = result.Hits; Invalidate(); if (Scanned != null) Scanned(result);
         }
         catch (Exception ex) { Scanning = false; if (Failed != null) Failed(ex.Message); }
@@ -534,17 +804,24 @@ public class ColorPicker : IDisposable
         handler(chosen);
     }
 }
-// 一列色碼組：目標色碼與容差，外加吸色與移除。「＋ 新增色碼組」每按一次就多一列。
-// 高亮色不再需要輸入，右邊的色票直接顯示自動算出的對比色，只供預覽。
+// 一列色碼組：樣本色碼與誤差，外加吸色、＋樣本與移除。
+// 「＋ 新增色碼組」每按一次就多一列。高亮色不必輸入，色票直接顯示自動算出的對比色。
 // 繼承 BufferedEditorPanel（本身就是設好雙緩衝的 TableLayoutPanel），色票與按鈕重繪不閃動。
+//
+// 一列色碼組：一個色碼與一個誤差，外加吸色與移除。
+// 誤差是 Lab 空間的感知距離 ΔE，一個數字同時管好色相、彩度與明暗的取捨。
 public class ColorRuleRow : BufferedEditorPanel
 {
-    public readonly TextBox Target = new TextBox { Width = 104 };
-    public readonly NumericUpDown Tolerance = new NumericUpDown { Minimum = 0, Maximum = 255, Value = 24, Width = 66 };
+    public readonly TextBox Target = new TextBox { Width = 120 };
+    public readonly NumericUpDown Tolerance = new NumericUpDown
+    {
+        Minimum = ColorMatch.MinTolerance, Maximum = ColorMatch.MaxTolerance, Value = ColorMatch.DefaultTolerance, Width = 62
+    };
     readonly Panel targetSwatch = Swatch(), highlightSwatch = Swatch();
     readonly Label index = new Label { AutoSize = true, ForeColor = Color.DimGray };
     public event Action Changed; public event Action<ColorRuleRow> Removed; public event Action<ColorRuleRow> PickRequested;
-    static Panel Swatch() { return new Panel { Width = 24, Height = 24, BorderStyle = BorderStyle.FixedSingle }; }
+    bool syncing;
+    static Panel Swatch() { return new Panel { Width = 26, Height = 26, BorderStyle = BorderStyle.FixedSingle }; }
     // 按鈕一律 GrowAndShrink＋內距＋最小寬度。只給 AutoSize 的話，偏好大小會先用預設字型
     // （8.25pt 英文字型）算好，等這一列被加進工具視窗換成 10pt 中文字型後不再放大，文字就被擠壓。
     static Button Small(string text)
@@ -552,7 +829,7 @@ public class ColorRuleRow : BufferedEditorPanel
         return new Button
         {
             Text = text, AutoSize = true, AutoSizeMode = AutoSizeMode.GrowAndShrink,
-            Padding = new Padding(12, 4, 12, 4), MinimumSize = new Size(68, 28)
+            Padding = new Padding(10, 4, 10, 4), MinimumSize = new Size(72, 28)
         };
     }
     // 整列用 TableLayoutPanel，每個格子都只 Anchor 左側，版面就會自動把高矮不同的
@@ -565,18 +842,19 @@ public class ColorRuleRow : BufferedEditorPanel
         Margin = new Padding(0, 0, 0, 6); Padding = new Padding(10, 5, 10, 5); BackColor = Color.White;
         int column = 0;
         Place(index, ref column, 10);
-        Place(Cap("目標色碼"), ref column, 8);
+        Place(Cap("色碼"), ref column, 8);
         Place(Target, ref column, 6);
-        Place(targetSwatch, ref column, 14);
+        Place(targetSwatch, ref column, 12);
         var pick = Small("吸色"); pick.Click += (s, e) => { if (PickRequested != null) PickRequested(this); };
-        Place(pick, ref column, 22);
+        Place(pick, ref column, 18);
         Place(Cap("高亮"), ref column, 8);
-        Place(highlightSwatch, ref column, 22);
-        Place(Cap("容差"), ref column, 8);
-        Place(Tolerance, ref column, 22);
+        Place(highlightSwatch, ref column, 18);
+        Place(Cap("誤差 ΔE"), ref column, 8);
+        Place(Tolerance, ref column, 18);
         var remove = Small("移除"); remove.Click += (s, e) => { if (Removed != null) Removed(this); };
         Place(remove, ref column, 0);
-        Target.TextChanged += (s, e) => Sync(true); Tolerance.ValueChanged += (s, e) => { if (Changed != null) Changed(); };
+        Target.TextChanged += (s, e) => { if (!syncing) Sync(true); };
+        Tolerance.ValueChanged += (s, e) => { if (!syncing) Sync(true); };
         Value = rule ?? new ColorRule();
     }
     void Place(Control child, ref int column, int gap)
@@ -592,17 +870,37 @@ public class ColorRuleRow : BufferedEditorPanel
         PerformLayout();
     }
     static Label Cap(string text) { return new Label { Text = text, AutoSize = true }; }
+    static int Clamp(int value, int low, int high) { return Math.Max(low, Math.Min(high, value)); }
     public void SetIndex(int number) { index.Text = "#" + number; }
     public ColorRule Value
     {
         get { return new ColorRule { Target = Target.Text, Tolerance = (int)Tolerance.Value }; }
-        set { Target.Text = value.Target; Tolerance.Value = Math.Max(0, Math.Min(255, value.Tolerance)); Sync(false); }
+        set
+        {
+            var rule = value ?? new ColorRule();
+            syncing = true;
+            try
+            {
+                Target.Text = rule.Target;
+                Tolerance.Value = Clamp(rule.Tolerance, ColorMatch.MinTolerance, ColorMatch.MaxTolerance);
+            }
+            finally { syncing = false; }
+            Sync(false);
+        }
     }
-    // 解析一次就好，三個地方共用結果。容差有 NumericUpDown 限制範圍，不必再驗。
+    // 解析一次就好，好幾個地方共用結果。誤差有 NumericUpDown 限制範圍，不必再驗。
     bool Resolve(out Color target) { return ColorRule.TryParse(Target.Text, out target); }
     public bool IsValid { get { Color ignored; return Resolve(out ignored); } }
     // 目標色解析不出來時回中性色而不是丟例外——屬性 getter 不該丟例外。
-    public Color Highlight { get { Color target; return Resolve(out target) ? ColorRule.Contrast(target) : SystemColors.Control; } }
+    public Color Highlight
+    {
+        get { Color target; return Resolve(out target) ? ColorRule.Contrast(target) : SystemColors.Control; }
+    }
+    // 編譯好的比對器，解析不出來就回 null（呼叫端本來就只送 IsValid 的列去掃描）。
+    public ColorMatch Compiled
+    {
+        get { try { return ColorMatch.Compile(Value); } catch { return null; } }
+    }
     void Sync(bool notify)
     {
         Color target;
@@ -610,6 +908,243 @@ public class ColorRuleRow : BufferedEditorPanel
         targetSwatch.BackColor = valid ? target : SystemColors.Control;
         highlightSwatch.BackColor = valid ? ColorRule.Contrast(target) : SystemColors.Control;
         if (notify && Changed != null) Changed();
+    }
+}
+// 誤差邊界上的一個顏色。
+// Inside 是拿這個顏色真的去問過比對器的結果——sRGB 只覆蓋 Lab 空間的一小塊，推到邊界的
+// 座標常常落在色域外而被夾回來，夾過的距離就變了。與其去猜，不如問一次然後照實標示。
+//
+// 刻意沒有「最糟的角落」這種標記：Lab 是歐氏空間，八個角和六個軸向離目標色的距離完全相同
+//（測試釘住了這件事），所以沒有哪一格比別格更糟。
+public class ToleranceSample
+{
+    public Color Colour; public string Label; public bool Inside;
+}
+// 一排極限色，配一句說明這排在示範什麼。
+public class ToleranceGroup
+{
+    public string Caption; public List<ToleranceSample> Samples = new List<ToleranceSample>();
+}
+// 誤差極限預覽：把「還會被判定為命中」的最極端顏色列出來。
+//
+// 為什麼需要這個工具：誤差是一個數字，但它圈出來的範圍是三維的。光看「12」完全想像不出
+// 邊界長什麼樣，只能一邊掃一邊猜。把邊界上最極端的幾個點直接畫出來，色偏有多嚴重就一目了然
+// ——畫出來的每一個顏色都會被判定為命中。
+//
+// 每個色票中央再畫上這組實際會用的高亮色，順便驗證另一件事：
+// 高亮色必須在整個誤差範圍內都看得出來，否則命中了也看不到。
+//
+// 產生極限色與繪製都是靜態且不碰視窗的，所以自我測試可以直接把整頁畫成 PNG 檢查。
+public static class TolerancePreview
+{
+    const int Pad = 16, CellWidth = 78, CellHeight = 96, SwatchWidth = 72, SwatchHeight = 56, Inner = 20;
+    public static List<ToleranceGroup> Extremes(ColorRule rule)
+    {
+        var groups = new List<ToleranceGroup>();
+        ColorMatch match;
+        try { match = ColorMatch.Compile(rule); } catch { return groups; }
+        float L, a, b;
+        match.Lab(out L, out a, out b);
+        float step = match.Tolerance;
+        // Lab 的三個軸就是人眼感受的三個方向，所以極限色沿著這三個軸推出去最有解釋力：
+        //   L 明暗、a 綠↔紅、b 藍↔黃
+        // 誤差是這三個方向合成的距離，所以單軸推滿是「只有一個方向偏掉」的極限，
+        // 而三軸各推 1/√3 是「三個方向同時偏」的極限——後者才是最糟的情況。
+        var axes = new ToleranceGroup { Caption = "單一方向推到邊界（Lab 三軸）——每個色票都是該方向上還會命中的最極端顏色" };
+        Add(axes, match, match.Target, "目標");
+        Add(axes, match, Edge(match, L, a, b, -step, 0f, 0f), "更暗 L−" + Round(step));
+        Add(axes, match, Edge(match, L, a, b, step, 0f, 0f), "更亮 L+" + Round(step));
+        Add(axes, match, Edge(match, L, a, b, 0f, -step, 0f), "偏綠 a−" + Round(step));
+        Add(axes, match, Edge(match, L, a, b, 0f, step, 0f), "偏紅 a+" + Round(step));
+        Add(axes, match, Edge(match, L, a, b, 0f, 0f, -step), "偏藍 b−" + Round(step));
+        Add(axes, match, Edge(match, L, a, b, 0f, 0f, step), "偏黃 b+" + Round(step));
+        groups.Add(axes);
+        float diagonal = step / (float)Math.Sqrt(3.0);
+        var corners = new ToleranceGroup { Caption = "三個方向同時偏（Lab 的八個角）——離目標色的距離和上面一排完全相同，只是偏的方向不同" };
+        foreach (int i in new[] { -1, 1 })
+            foreach (int j in new[] { -1, 1 })
+                foreach (int k in new[] { -1, 1 })
+                    Add(corners, match, Edge(match, L, a, b, i * diagonal, j * diagonal, k * diagonal),
+                        Sign(i) + Sign(j) + Sign(k));
+        groups.Add(corners);
+        return groups;
+    }
+    static string Round(float value) { return value.ToString("0.#"); }
+    // 同一排裡重複的顏色沒有資訊量（誤差 0、或目標色本來就貼著色域邊界時就會撞在一起）。
+    // Inside 一律拿真正的比對器問過，預覽才不會宣稱一個其實不命中的顏色會命中。
+    static void Add(ToleranceGroup group, ColorMatch match, Color colour, string label)
+    {
+        int argb = colour.ToArgb();
+        if (group.Samples.Any(s => s.Colour.ToArgb() == argb)) return;
+        group.Samples.Add(new ToleranceSample { Colour = colour, Label = label, Inside = match.Hit(colour) });
+    }
+    // 找出某個 Lab 方向上「還會命中的最極端顏色」。
+    //
+    // 為什麼不直接用邊界值：Lab 的座標不是每一點都畫得出來。sRGB 只覆蓋 Lab 空間的一小塊，
+    // 推出去的座標常常落在色域外，反算回 RGB 時會被夾住，而夾過的顏色距離就變了
+    //（通常變得更遠，於是那個色票其實不命中）。暗色特別嚴重，因為它們貼著色域的角落。
+    // 所以不去猜一個安全的內縮比例，而是從邊界往目標色退，取第一個真的命中的。
+    // 退到最後一階就是目標色本身，所以正常情況一定會找到。
+    const int EdgeSteps = 24;
+    static Color Edge(ColorMatch match, float L, float a, float b, float dL, float da, float db)
+    {
+        for (int i = 0; i <= EdgeSteps; i++)
+        {
+            float factor = 1f - i / (float)EdgeSteps;
+            var candidate = Perceptual.FromLab(L + dL * factor, a + da * factor, b + db * factor);
+            if (match.Hit(candidate)) return candidate;
+        }
+        return Perceptual.FromLab(L, a, b);
+    }
+    static string Sign(int value) { return value > 0 ? "+" : "−"; }
+    // 由上往下比對，所以上面的規則若已經吃下下面那組的樣本色，下面那組永遠不會有命中。
+    // 這是真的會讓人踩到的坑（感知上協調的材質距離很近，很容易互相吃掉），所以直接算出來講明，
+    // 不要只在說明文字裡提一句。
+    public static List<string> Overlaps(IList<ColorRule> rules)
+    {
+        var warnings = new List<string>();
+        if (rules == null) return warnings;
+        var compiled = new List<ColorMatch>();
+        foreach (var rule in rules)
+        {
+            ColorMatch match = null;
+            try { match = ColorMatch.Compile(rule); } catch { match = null; }
+            compiled.Add(match);
+        }
+        for (int lower = 0; lower < compiled.Count; lower++)
+        {
+            if (compiled[lower] == null) continue;
+            for (int upper = 0; upper < lower; upper++)
+            {
+                if (compiled[upper] == null) continue;
+                if (!compiled[upper].Hit(compiled[lower].Target)) continue;
+                warnings.Add("#" + (lower + 1) + " 的色碼落在 #" + (upper + 1) + " 的誤差內（相距 ΔE "
+                    + compiled[upper].DistanceTo(compiled[lower].Target).ToString("0.#")
+                    + "），#" + (lower + 1) + " 永遠不會有命中。把它移到 #" + (upper + 1) + " 上面，或縮小 #" + (upper + 1) + " 的誤差。");
+            }
+        }
+        return warnings;
+    }
+    // 一句話交代這組規則的比對設定，色票上方那行就是它。
+    public static string Describe(ColorRule rule)
+    {
+        if (rule == null) return "";
+        Color ignored;
+        if (!ColorRule.TryParse(rule.Target, out ignored)) return "色碼還沒填好";
+        return "感知距離 ΔE ≤ " + rule.Tolerance;
+    }
+    // g 傳 null 就只算高度，不畫東西——同一份版面計算同時服務捲動範圍與實際繪製，
+    // 兩邊不會算出不一樣的結果。
+    public static int Layout(int width, IList<ColorRule> rules, Graphics g)
+    {
+        int y = Pad, right = Math.Max(CellWidth + Pad * 2, width) - Pad;
+        using (var head = new Font("Microsoft JhengHei UI", 10.5f, FontStyle.Bold))
+        using (var body = new Font("Microsoft JhengHei UI", 9))
+        using (var tiny = new Font("Microsoft JhengHei UI", 8))
+        using (var mono = new Font("Consolas", 8))
+        using (var warn = new SolidBrush(Color.FromArgb(176, 60, 0)))
+        {
+            if (g != null) g.Clear(Color.White);
+            var warnings = Overlaps(rules);
+            if (warnings.Count > 0)
+            {
+                Text(g, "規則互相重疊", head, warn, Pad, y); y += 24;
+                foreach (string line in warnings) { Text(g, "• " + line, body, warn, Pad, y); y += 20; }
+                y += 8;
+            }
+            if (rules == null || rules.Count == 0)
+            {
+                Text(g, "還沒有色碼組。先在工具視窗按「＋ 新增色碼組」填一個顏色。", body, Brushes.DimGray, Pad, y);
+                return y + 30 + Pad;
+            }
+            for (int i = 0; i < rules.Count; i++)
+            {
+                var rule = rules[i];
+                Text(g, "#" + (i + 1) + "　" + (rule == null ? "" : (rule.Target ?? "").Trim()), head, Brushes.Black, Pad, y); y += 24;
+                Text(g, Describe(rule), body, Brushes.DimGray, Pad, y); y += 24;
+                // 下面整段都會碰 rule.Target，所以空的那一列在這裡就收掉，不要靠「Extremes 剛好回空清單」擋著。
+                if (rule == null) { y += 10; continue; }
+                foreach (var group in Extremes(rule))
+                {
+                    Text(g, group.Caption, tiny, Brushes.DimGray, Pad, y); y += 18;
+                    int x = Pad;
+                    Color parsed;
+                    var highlight = ColorRule.TryParse(rule.Target, out parsed) ? ColorRule.Contrast(parsed) : Color.Black;
+                    foreach (var one in group.Samples)
+                    {
+                        if (x + CellWidth > right && x > Pad) { x = Pad; y += CellHeight; }
+                        var box = new Rectangle(x, y, SwatchWidth, SwatchHeight);
+                        Fill(g, one.Colour, box);
+                        // 中央那一小塊就是實際會畫上去的高亮色：在整個誤差範圍內都該看得出來。
+                        Fill(g, Color.FromArgb(ScanOverlay.StrongAlpha, highlight), new Rectangle(box.X + (SwatchWidth - Inner) / 2, box.Y + (SwatchHeight - Inner) / 2, Inner, Inner));
+                        // 邊界外的色票用虛線細框，而且標籤會說出來——預覽不該宣稱一個其實不命中的顏色會命中。
+                        if (g != null)
+                            using (var pen = new Pen(one.Inside ? Color.Silver : Color.Gray, 1))
+                            {
+                                if (!one.Inside) pen.DashStyle = System.Drawing.Drawing2D.DashStyle.Dash;
+                                g.DrawRectangle(pen, box);
+                            }
+                        Text(g, ColorRule.Format(one.Colour), mono, one.Inside ? Brushes.Black : Brushes.Gray, x, y + SwatchHeight + 3);
+                        Text(g, one.Label + (one.Inside ? "" : "（界外）"), tiny, Brushes.DimGray, x, y + SwatchHeight + 19);
+                        x += CellWidth;
+                    }
+                    y += CellHeight + 6;
+                }
+                y += 10;
+            }
+            Text(g, "虛線框＝已經在誤差外，不會命中（那個方向出了 sRGB 色域）。中央小方塊是實際會畫上去的高亮色。", tiny, Brushes.DimGray, Pad, y);
+            y += 24;
+        }
+        return y + Pad;
+    }
+    static void Text(Graphics g, string value, Font font, Brush brush, int x, int y)
+    {
+        if (g != null && !string.IsNullOrEmpty(value)) g.DrawString(value, font, brush, x, y);
+    }
+    static void Fill(Graphics g, Color colour, Rectangle box)
+    {
+        if (g == null) return;
+        using (var brush = new SolidBrush(colour)) g.FillRectangle(brush, box);
+    }
+}
+// 誤差預覽視窗。整頁自繪而不是擺幾十個控制項：色票的數量隨規則與樣本數變動，
+// 自繪省掉不斷建立與回收控制項的麻煩，也讓同一份繪製程式可以直接輸出成 PNG 供自我測試檢查。
+public class ToleranceForm : Form
+{
+    readonly Sheet sheet = new Sheet();
+    bool laying;
+    class Sheet : Panel
+    {
+        public List<ColorRule> Rules = new List<ColorRule>();
+        public Sheet() { Dock = DockStyle.Top; DoubleBuffered = true; BackColor = Color.White; }
+        protected override void OnPaint(PaintEventArgs e) { base.OnPaint(e); TolerancePreview.Layout(ClientSize.Width, Rules, e.Graphics); }
+    }
+    public ToleranceForm(IList<ColorRule> rules)
+    {
+        Icon = AppIdentity.Icon; Text = "誤差極限預覽"; Size = new Size(920, 620); MinimumSize = new Size(560, 360);
+        // CenterParent 只在 ShowDialog 生效，這個視窗是非模態的（要能一邊看一邊調誤差），所以用 CenterScreen。
+        Font = new Font("Microsoft JhengHei UI", 10); StartPosition = FormStartPosition.CenterScreen;
+        BackColor = Color.White; AutoScroll = true;
+        sheet.Rules = rules == null ? new List<ColorRule>() : rules.ToList();
+        Controls.Add(sheet);
+        // 高度由版面計算決定，寬度靠 Dock.Top 跟著視窗。只在值真的變了才設，否則會和版面事件互相觸發。
+        ClientSizeChanged += (s, e) => Relayout();
+        Relayout();
+    }
+    // 改 sheet 的高度會讓 AutoScroll 的捲軸出現或消失，客戶區寬度跟著變，於是又回到這裡。
+    // 沒有這個旗標，換寬度與換高度會互相觸發個不停。
+    void Relayout()
+    {
+        if (laying) return;
+        laying = true;
+        try
+        {
+            int width = sheet.ClientSize.Width > 0 ? sheet.ClientSize.Width : ClientSize.Width;
+            int wanted = TolerancePreview.Layout(width, sheet.Rules, null);
+            if (sheet.Height != wanted) sheet.Height = wanted;
+            sheet.Invalidate();
+        }
+        finally { laying = false; }
     }
 }
 // 會被寫進 JSON 的完整設定。所有欄位都用屬性，JavaScriptSerializer 才讀寫得到；
@@ -679,8 +1214,8 @@ public class ScanStudioForm : Form
     internal readonly NumericUpDown areaX = Num(-100000, 100000, 0), areaY = Num(-100000, 100000, 0), areaW = Num(ScanOverlay.MinSide, 8000, 320), areaH = Num(ScanOverlay.MinSide, 8000, 240);
     // 下限與預設都引用方塊那邊的 DefaultInterval，避免欄位收得進去、方塊那邊又默默夾掉。
     internal readonly NumericUpDown interval = Num(ScanOverlay.DefaultInterval, 10000, ScanOverlay.DefaultInterval), sample = Num(1, 32, ScanOverlay.DefaultSample), block = Num(1, 64, ScanOverlay.DefaultBlock);
-    internal readonly Button scanButton = Flat("開始掃描 (F7)"), lockButton = Flat("鎖定掃描範圍"), addRule = Flat("＋ 新增色碼組"), centerButton = Flat("置中於主螢幕");
-    internal readonly CheckBox blink = new CheckBox { Text = "高亮閃爍", AutoSize = true, Checked = true, Margin = new Padding(16, 9, 0, 0) };
+    internal readonly Button scanButton = Flat("開始掃描 (F7)"), lockButton = Flat("鎖定掃描範圍"), addRule = Flat("＋ 新增色碼組"), centerButton = Flat("置中於主螢幕"), previewButton = Flat("誤差預覽");
+    internal readonly CheckBox blink = new CheckBox { Text = "高亮閃爍（截圖拍得到）", AutoSize = true, Checked = true, Margin = new Padding(16, 9, 0, 0) };
     internal readonly Label status = new Label { AutoSize = true, Margin = new Padding(2, 8, 2, 4), Text = "就緒｜新增色碼組後按「開始掃描 (F7)」" };
     public const int HotStart = 7, HotStop = 8, KeyStart = 118, KeyStop = 119;
     // 所有按鈕統一最小高度，FlowLayoutPanel 是靠上對齊，高度一致才看起來整齊。
@@ -726,12 +1261,29 @@ public class ScanStudioForm : Form
         Field(timing, "掃描間隔（ms）", interval); Field(timing, "取樣間隔（px）", sample); Field(timing, "色塊大小（px）", block);
         var adder = Row(); layout.Controls.Add(adder, 0, 3);
         adder.Controls.Add(addRule);
-        adder.Controls.Add(Hint("輸入色碼或按「吸色」取色，高亮自動用對比色\n由上往下比對：上方色碼組的容差若已涵蓋下方的目標色，下方那組就不會有命中"));
+        adder.Controls.Add(previewButton);
+        // 說明文字只講使用者看得到的因果：怎麼調、調過頭長什麼樣。
+        // 不解釋 ΔE 是什麼公式，也不教材質分類——那會讓人以為誤差是拿來配色的。
+        adder.Controls.Add(Hint(
+            "預設 6 夠涵蓋同一件東西在畫面上的深淺色域\n" +
+            "掃不到就往上加一點；用吸色取出的顏色可以調到 3\n" +
+            "上限 15：再往上會命中無關的深灰，整塊的色塊碎成散落各處的雜點——看到雜點就調小\n" +
+            "由上往下比對：上方色碼組吃掉的顏色，下方那組就不會有命中"));
         layout.Controls.Add(rules, 0, 4); layout.Controls.Add(status, 0, 5);
-        addRule.Click += (s, e) => Guard(() => { AddRule(new ColorRule()); status.Text = "已新增色碼組 #" + rules.Controls.Count; });
+        addRule.Click += (s, e) => Guard(() => { AddRule(new ColorRule()); status.Text = "已新增色碼組 #" + rules.Controls.Count + "｜預設誤差 " + ColorMatch.DefaultTolerance + "，掃不到往上加、看到雜點往下調（上限 15）"; });
+        previewButton.Click += (s, e) => Guard(ShowTolerancePreview);
         scanButton.Click += (s, e) => Guard(() => SetScanning(!scanning));
         lockButton.Click += (s, e) => Guard(() => SetLocked(!overlay.Locked));
-        blink.CheckedChanged += (s, e) => { overlay.Blink = blink.Checked; if (!syncing) status.Text = blink.Checked ? "高亮改為閃爍（亮暗各半）。" : "高亮改為持續顯示。"; };
+        // 關掉閃爍要靠排除擷取才能真的不閃。系統不支援時 overlay 會自己退回暗相位，
+        // 那件事使用者看得到（畫面還是在閃），所以狀態列必須說出來而不是假裝成功。
+        blink.CheckedChanged += (s, e) =>
+        {
+            overlay.Blink = blink.Checked;
+            if (syncing) return;
+            if (blink.Checked) status.Text = "高亮改為閃爍（亮暗各半，1 秒一次）｜你自己截圖拍得到高亮。";
+            else if (overlay.NeedsBlanking) status.Text = "這台電腦不支援把視窗排除在螢幕擷取之外（需要 Win10 2004 以後），高亮仍會短暫閃爍。";
+            else status.Text = "高亮改為持續顯示，完全不閃｜代價是你自己截圖時拍不到高亮，要截圖請勾回閃爍。";
+        };
         foreach (var field in new[] { areaX, areaY, areaW, areaH }) field.ValueChanged += (s, e) => { if (!syncing) Guard(ApplyArea); };
         interval.ValueChanged += (s, e) => { if (!syncing) overlay.Interval = (int)interval.Value; };
         sample.ValueChanged += (s, e) => { if (!syncing) overlay.Sample = (int)sample.Value; };
@@ -836,14 +1388,17 @@ public class ScanStudioForm : Form
     // 只把能解析的色碼送進掃描，輸入途中的半成品不會中斷掃描。
     void ApplyRules()
     {
-        var valid = Rows().Where(r => r.IsValid).Select(r => r.Value).ToList();
-        overlay.Targets = valid.Select(r => ColorRule.Parse(r.Target)).ToList();
-        overlay.Tolerances = valid.Select(r => r.Tolerance).ToList();
-        overlay.Highlights = valid.Select(r => ColorRule.Contrast(ColorRule.Parse(r.Target))).ToList();
+        var matches = new List<ColorMatch>();
+        foreach (var row in Rows())
+        {
+            var match = row.IsValid ? row.Compiled : null;
+            if (match != null) matches.Add(match);
+        }
+        overlay.Matches = matches;
         int total = rules.Controls.Count;
-        overlay.Scanning = scanning && overlayShown && overlay.Visible && valid.Count > 0;
+        overlay.Scanning = scanning && overlayShown && overlay.Visible && matches.Count > 0;
         if (total == 0) status.Text = "請先按「＋ 新增色碼組」輸入要找的顏色。";
-        else if (valid.Count < total) status.Text = "有 " + (total - valid.Count) + " 組色碼還沒填好，" + (scanning ? "先用其餘 " + valid.Count + " 組掃描。" : "填好後可開始掃描。");
+        else if (matches.Count < total) status.Text = "有 " + (total - matches.Count) + " 組色碼還沒填好，" + (scanning ? "先用其餘 " + matches.Count + " 組掃描。" : "填好後可開始掃描。");
         overlay.Invalidate();
     }
     void ApplyArea()
@@ -902,6 +1457,16 @@ public class ScanStudioForm : Form
         ownerMinimized = false; parent.WindowState = ownerState;
     }
     internal NumericUpDown[] GeometryFields() { return new[] { areaX, areaY, areaW, areaH }; }
+    // 誤差預覽：拿當下所有列（含還沒填好的，預覽視窗自己會標示）開一個非模態視窗。
+    // 非模態才能一邊看極限色一邊調誤差，改完再按一次看新的範圍。
+    internal List<ColorRule> PreviewRules() { return Rows().Select(r => r.Value).ToList(); }
+    void ShowTolerancePreview()
+    {
+        var window = new ToleranceForm(PreviewRules());
+        window.Owner = this;
+        window.Show();
+        status.Text = "誤差預覽已開啟：畫出來的每個顏色都會被判定為命中。改完誤差再按一次可以看新的範圍。";
+    }
     // 鎖定＝方塊完全固定＋全穿透，滑鼠事件一律傳到下方程式；編輯模式＝可拖曳邊框移動與四角縮放。
     internal void SetLocked(bool locked)
     {
@@ -968,7 +1533,8 @@ public class ScanStudioForm : Form
         if (pickOverlay) ShowOverlay(true);
         picking = false;
         var row = pickRow; pickRow = null;
-        if (chosen.HasValue && row != null && !row.IsDisposed) { row.Target.Text = ColorRule.Format(chosen.Value); status.Text = "已擷取顏色 " + row.Target.Text; }
-        else status.Text = "已取消吸色";
+        if (!chosen.HasValue || row == null || row.IsDisposed) { status.Text = "已取消吸色"; return; }
+        row.Target.Text = ColorRule.Format(chosen.Value);
+        status.Text = "已擷取顏色 " + row.Target.Text;
     }
 }
